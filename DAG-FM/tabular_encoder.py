@@ -334,6 +334,7 @@ class DAGFMTabularEncoder(nn.Module):
         self,
         table: Tensor,
         observation_mask: Optional[Tensor] = None,
+        variable_embeddings: Optional[Tensor] = None,
     ) -> Tensor:
         """将观测表格编码为逐变量表示。
 
@@ -356,6 +357,10 @@ class DAGFMTabularEncoder(nn.Module):
                 if observation_mask.ndim != 2:
                     raise ValueError("二维 table 的 observation_mask 也必须是二维。")
                 observation_mask = observation_mask.unsqueeze(0)
+            if variable_embeddings is not None:
+                if variable_embeddings.ndim != 2:
+                    raise ValueError("二维 table 的 variable_embeddings 必须是 [D,E]。")
+                variable_embeddings = variable_embeddings.unsqueeze(0)
         elif observation_mask is not None and observation_mask.ndim != 3:
             raise ValueError("三维 table 的 observation_mask 也必须是三维。")
 
@@ -364,6 +369,20 @@ class DAGFMTabularEncoder(nn.Module):
             raise ValueError("样本数和变量数都必须大于 0。")
         if not torch.isfinite(table).all():
             raise ValueError("输入包含 NaN 或 Inf；请在编码前完成缺失值处理。")
+
+        # 可选变量角色在任何集合交互之前注入。它不编码具体列号，只用于区分
+        # 普通候选变量与目标变量，因此仍保持候选变量之间的置换等变性。
+        if variable_embeddings is not None:
+            expected_shape = (batch_size, num_variables, self.embedding_dim)
+            if variable_embeddings.shape != expected_shape:
+                raise ValueError(
+                    f"variable_embeddings 应为 {expected_shape}，"
+                    f"实际为 {tuple(variable_embeddings.shape)}。"
+                )
+            if variable_embeddings.device != table.device:
+                raise ValueError("variable_embeddings 和 table 必须位于同一设备。")
+            if variable_embeddings.dtype != table.dtype:
+                raise TypeError("variable_embeddings 和 table 必须使用相同 dtype。")
 
         # 检查并标准化观测掩码；True 表示有效，与 PyTorch padding mask 相反。
         if observation_mask is not None:
@@ -378,6 +397,8 @@ class DAGFMTabularEncoder(nn.Module):
 
         # [B, N, D] -> [B, N, D, E]
         hidden = self.scalar_embedding(table.unsqueeze(-1))
+        if variable_embeddings is not None:
+            hidden = hidden + variable_embeddings.unsqueeze(1)
 
         # 样本维交互：把每个变量视为一个独立的样本集合。
         # [B, N, D, E] -> [B*D, N, E]

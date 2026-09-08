@@ -111,6 +111,84 @@ class AttentionSequencePooling(nn.Module):
         return self.output_norm(pooled.squeeze(1))
 
 
+class TargetFactorStatisticsEncoder(nn.Module):
+    """把不会被深层集合池化抹去的 X-Y 直接统计证据编码为逐因子残差。
+
+    合成目标包含线性、tanh、signed-square、sin 和 threshold 五类机制。
+    这里计算前四类基函数与 Y 的有符号/绝对相关性，并附加有效观测比例。
+    这些量只由模型可见的 X、Y 和 mask 得到，不读取 z、tau 或生成元数据。
+    """
+
+    num_statistics = 9
+
+    def __init__(self, embedding_dim: int) -> None:
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.LayerNorm(self.num_statistics),
+            nn.Linear(self.num_statistics, embedding_dim),
+            nn.GELU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+
+    @staticmethod
+    def _masked_correlation(
+        transformed_factors: Tensor,
+        centered_target: Tensor,
+        mask: Tensor,
+        count: Tensor,
+    ) -> Tensor:
+        transformed_mean = (
+            transformed_factors * mask
+        ).sum(dim=(1, 2)) / count
+        centered_factors = (
+            transformed_factors - transformed_mean[:, None, None, :]
+        ) * mask
+        covariance = (centered_factors * centered_target).sum(dim=(1, 2))
+        factor_energy = centered_factors.square().sum(dim=(1, 2))
+        target_energy = centered_target.square().sum(dim=(1, 2))
+        denominator = (factor_energy * target_energy).clamp_min(1e-12).sqrt()
+        return covariance / denominator
+
+    def forward(
+        self,
+        factors: Tensor,
+        targets: Tensor,
+        feature_mask: Tensor,
+        target_mask: Tensor,
+    ) -> Tensor:
+        """返回 `[B,D,E]` 的目标—因子统计残差。"""
+
+        output_dtype = factors.dtype
+        # 原始观测不需要梯度；固定统计量在 float32 中计算以避免 AMP 下
+        # 小方差和相关系数分母发生下溢，投影网络本身仍然参与正常训练。
+        with torch.no_grad():
+            x = factors.float()
+            y = targets.float().unsqueeze(-1)
+            valid = (feature_mask & target_mask.unsqueeze(-1)).float()
+            count = valid.sum(dim=(1, 2)).clamp_min(1.0)
+            target_mean = (y * valid).sum(dim=(1, 2)) / count
+            centered_target = (y - target_mean[:, None, None, :]) * valid
+
+            correlations = []
+            for transformed in (
+                x,
+                torch.tanh(2.0 * x),
+                torch.sign(x) * x.square(),
+                torch.sin(torch.pi * x),
+            ):
+                correlations.append(
+                    self._masked_correlation(
+                        transformed, centered_target, valid, count
+                    )
+                )
+            signed = torch.stack(correlations, dim=-1)
+            available_target = target_mask.sum(dim=(1, 2)).clamp_min(1)
+            coverage = count / available_target[:, None].float()
+            statistics = torch.cat((signed, signed.abs(), coverage.unsqueeze(-1)), dim=-1)
+
+        return self.projection(statistics.to(dtype=output_dtype))
+
+
 class CausalRankPanelEncoder(nn.Module):
     """把金融面板编码成候选因子和目标收益的基础统计表示。
 
@@ -196,6 +274,12 @@ class CausalRankPanelEncoder(nn.Module):
         self.factor_role_embedding = nn.Parameter(torch.zeros(1, 1, 1, embedding_dim))
         # 收益角色向量告诉模型最后一个 Token 是需要研究的特殊目标 Y。
         self.target_role_embedding = nn.Parameter(torch.zeros(1, 1, 1, embedding_dim))
+        nn.init.normal_(self.factor_role_embedding, mean=0.0, std=0.02)
+        nn.init.normal_(self.target_role_embedding, mean=0.0, std=0.02)
+        # 直接统计残差为每个因子保留与目标的低阶依赖信号，防止多层集合
+        # 注意力在秩归一化边际分布上收敛到所有因子相同的表示。
+        self.target_factor_statistics = TargetFactorStatisticsEncoder(embedding_dim)
+        self.factor_statistics_norm = nn.LayerNorm(embedding_dim)
 
         # 只有 market_state_dim 大于零时才创建市场状态编码网络。
         if market_state_dim > 0:
@@ -276,14 +360,16 @@ class CausalRankPanelEncoder(nn.Module):
         self,
         tables: Tensor,
         observation_mask: Optional[Tensor],
+        variable_embeddings: Tensor,
     ) -> Tensor:
         """编码一组彼此独立的横截面表，可沿表批量维分发到多张 GPU。"""
 
         if len(self.cross_section_device_ids) > 1:
             module_kwargs = (
-                {}
-                if observation_mask is None
-                else {"observation_mask": observation_mask}
+                {
+                    "observation_mask": observation_mask,
+                    "variable_embeddings": variable_embeddings,
+                }
             )
             return data_parallel(
                 self.cross_section_encoder,
@@ -295,16 +381,20 @@ class CausalRankPanelEncoder(nn.Module):
         return self.cross_section_encoder(
             tables,
             observation_mask=observation_mask,
+            variable_embeddings=variable_embeddings,
         )
 
     def _encode_cross_section_tables_checkpointed(
         self,
         tables: Tensor,
         observation_mask: Optional[Tensor],
+        variable_embeddings: Tensor,
     ) -> Tensor:
         """编码横截面；激活重算由 DAG-FM replica 内部逐 block 执行。"""
 
-        return self._encode_cross_section_tables(tables, observation_mask)
+        return self._encode_cross_section_tables(
+            tables, observation_mask, variable_embeddings
+        )
 
     def _validate_and_batch_inputs(
         self,
@@ -574,6 +664,15 @@ class CausalRankPanelEncoder(nn.Module):
         # DAG-FM 编码器沿股票集合和变量集合提取联合统计表示。不同时间点
         # 在此阶段彼此独立，因此可以沿 B*T 精确分块或分发到多张 GPU。
         total_tables = joint_tables.shape[0]
+        # 在 DAG-FM 的第一层之前标出最后一列是目标 Y。候选因子共用同一个
+        # role，不引入因子编号，因此因子置换等变性保持不变。
+        factor_roles = self.factor_role_embedding.reshape(
+            1, 1, self.embedding_dim
+        ).expand(total_tables, num_factors, -1)
+        target_roles = self.target_role_embedding.reshape(
+            1, 1, self.embedding_dim
+        ).expand(total_tables, 1, -1)
+        variable_embeddings = torch.cat((factor_roles, target_roles), dim=1)
         chunk_size = self.cross_section_chunk_size or total_tables
         seeded_chunks = []
         for start in range(0, total_tables, chunk_size):
@@ -587,6 +686,7 @@ class CausalRankPanelEncoder(nn.Module):
                 self._encode_cross_section_tables_checkpointed(
                     joint_tables[start:stop],
                     mask_chunk,
+                    variable_embeddings[start:stop],
                 )
             )
         seeded_features = (
@@ -609,7 +709,8 @@ class CausalRankPanelEncoder(nn.Module):
             num_factors + 1,
             self.embedding_dim,
         )
-        # 给前 D 个候选因子加入相同的因子身份提示，但不编码具体因子编号。
+        # 输入端已经注入角色；输出端保留同一角色残差，避免深层池化再次
+        # 淡化目标身份，同时仍不编码具体候选因子的列编号。
         factor_features = (
             cross_section_features[:, :, :num_factors]
             + self.factor_role_embedding
@@ -801,6 +902,15 @@ class CausalRankPanelEncoder(nn.Module):
         )
         # 前 D 个变量位置属于候选因子，最后一个位置属于目标收益 Y。
         factor_features = temporal_features[:, :-1]
+        statistical_features = self.target_factor_statistics(
+            factors,
+            target_returns,
+            feature_mask,
+            target_mask,
+        )
+        factor_features = self.factor_statistics_norm(
+            factor_features + statistical_features
+        )
         # 提取最后一个目标位置，得到每个面板一个 E 维收益目标表示。
         target_feature = temporal_features[:, -1]
         # 若调用者输入单个无批量面板，则同步移除两个输出的临时批量维。

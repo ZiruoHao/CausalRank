@@ -42,6 +42,7 @@ else:
 
 @dataclass(frozen=True)
 class ModelConfig:
+    architecture_version: int = 2
     market_state_dim: int = 0
     embedding_dim: int = 128
     num_heads: int = 8
@@ -125,15 +126,28 @@ def compute_losses(
     factor_mask: Tensor,
     effect_weight: float,
     rank_weight: float,
+    positive_class_weight: float,
 ) -> Dict[str, Tensor]:
     """计算 proposal 的存在性、效应强度和加权 pairwise 排序目标。"""
 
-    labels = labels.to(dtype=outputs["scores"].dtype)
-    effects = effects.to(dtype=outputs["scores"].dtype)
+    labels = labels.to(dtype=outputs["log_scores"].dtype)
+    effects = effects.to(dtype=outputs["log_scores"].dtype)
     valid = factor_mask
 
+    positive_count = (valid & labels.bool()).sum()
+    negative_count = (valid & ~labels.bool()).sum()
+    if positive_class_weight == 0.0:
+        pos_weight = (
+            negative_count.to(labels.dtype)
+            / positive_count.to(labels.dtype).clamp_min(1.0)
+        ).clamp_min(1.0)
+    else:
+        pos_weight = labels.new_tensor(positive_class_weight)
     causal_values = F.binary_cross_entropy_with_logits(
-        outputs["existence_logits"], labels, reduction="none"
+        outputs["existence_logits"].float(),
+        labels,
+        reduction="none",
+        pos_weight=pos_weight,
     )
     causal_num = causal_values.masked_fill(~valid, 0.0).sum()
     causal_den = valid.sum().to(causal_num.dtype)
@@ -146,7 +160,12 @@ def compute_losses(
     effect_loss = effect_num / effect_den.clamp_min(1.0)
 
     tau_difference = effects.unsqueeze(2) - effects.unsqueeze(1)
-    score_difference = outputs["scores"].unsqueeze(2) - outputs["scores"].unsqueeze(1)
+    # log-score 与推理时的 p*a 严格同序，但不会在 p 很小时把排序梯度
+    # 再乘一个接近零的概率门控。
+    score_difference = (
+        outputs["log_scores"].unsqueeze(2)
+        - outputs["log_scores"].unsqueeze(1)
+    )
     pair_mask = (
         valid.unsqueeze(2)
         & valid.unsqueeze(1)
@@ -169,6 +188,9 @@ def compute_losses(
         )
         pair_correct = ((score_difference > 0.0) & pair_mask).sum()
         pair_count = pair_mask.sum()
+        predicted_positive = outputs["existence_logits"] >= 0.0
+        true_positive = (predicted_positive & labels.bool() & valid).sum()
+        true_negative = ((~predicted_positive) & (~labels.bool()) & valid).sum()
     return {
         "loss": total,
         "causal_num": causal_num.detach(),
@@ -181,6 +203,10 @@ def compute_losses(
         "causal_correct": causal_correct.detach(),
         "pair_correct": pair_correct.detach(),
         "pair_count": pair_count.detach(),
+        "true_positive": true_positive.detach(),
+        "positive_count": positive_count.detach(),
+        "true_negative": true_negative.detach(),
+        "negative_count": negative_count.detach(),
     }
 
 
@@ -190,7 +216,8 @@ def empty_totals() -> Dict[str, float]:
         for name in (
             "causal_num", "causal_den", "effect_num", "effect_abs_num",
             "effect_den", "rank_num", "rank_den", "causal_correct",
-            "pair_correct", "pair_count", "batches",
+            "pair_correct", "pair_count", "true_positive", "positive_count",
+            "true_negative", "negative_count", "batches",
         )
     }
 
@@ -199,12 +226,17 @@ def summarize(totals: Mapping[str, float], effect_weight: float, rank_weight: fl
     causal = totals["causal_num"] / max(totals["causal_den"], 1.0)
     effect = totals["effect_num"] / max(totals["effect_den"], 1.0)
     ranking = totals["rank_num"] / max(totals["rank_den"], 1.0)
+    recall = totals["true_positive"] / max(totals["positive_count"], 1.0)
+    specificity = totals["true_negative"] / max(totals["negative_count"], 1.0)
     return {
         "loss": causal + effect_weight * effect + rank_weight * ranking,
         "causal_loss": causal,
         "effect_loss": effect,
         "ranking_loss": ranking,
         "existence_accuracy": totals["causal_correct"] / max(totals["causal_den"], 1.0),
+        "existence_recall": recall,
+        "existence_specificity": specificity,
+        "existence_balanced_accuracy": 0.5 * (recall + specificity),
         "effect_mae": totals["effect_abs_num"] / max(totals["effect_den"], 1.0),
         "pairwise_accuracy": totals["pair_correct"] / max(totals["pair_count"], 1.0),
         "valid_factors": totals["causal_den"],
@@ -228,6 +260,7 @@ def run_epoch(
     scaler: torch.amp.GradScaler,
     effect_weight: float,
     rank_weight: float,
+    positive_class_weight: float,
     grad_clip: float,
     max_batches: int,
 ) -> Tuple[Dict[str, float], int]:
@@ -254,6 +287,7 @@ def run_epoch(
                 supervision_mask,
                 effect_weight,
                 rank_weight,
+                positive_class_weight,
             )
         if training:
             scaler.scale(loss_items["loss"]).backward()
@@ -507,14 +541,17 @@ def main() -> None:
         f"validation={'none' if validation_loader is None else len(validation_loader.dataset)} "
         f"test={'none' if test_loader is None else len(test_loader.dataset)} "
         f"cross_section_devices={cross_section_device_ids or (str(device),)} "
-        f"checkpoint={args.cross_section_checkpoint}",
+        f"checkpoint={args.cross_section_checkpoint} "
+        f"positive_class_weight="
+        f"{'auto' if args.positive_class_weight == 0.0 else args.positive_class_weight}",
         flush=True,
     )
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             train_metrics, steps = run_epoch(
                 model, train_loader, device, optimizer, scaler,
-                args.effect_weight, args.rank_weight, args.grad_clip,
+                args.effect_weight, args.rank_weight,
+                args.positive_class_weight, args.grad_clip,
                 args.max_train_batches,
             )
             global_step += steps
@@ -523,7 +560,8 @@ def main() -> None:
                 with torch.no_grad():
                     validation_metrics, _ = run_epoch(
                         model, validation_loader, device, None, scaler,
-                        args.effect_weight, args.rank_weight, 0.0,
+                        args.effect_weight, args.rank_weight,
+                        args.positive_class_weight, 0.0,
                         args.max_validation_batches,
                     )
             selection_metric = (
@@ -543,7 +581,7 @@ def main() -> None:
             checkpoint_path = None
             if should_report:
                 checkpoint_payload = {
-                    "format_version": 1, "epoch": epoch, "global_step": global_step,
+                    "format_version": 2, "epoch": epoch, "global_step": global_step,
                     "best_metric": best_metric, "model_config": asdict(config),
                     "model": model.state_dict(), "optimizer": optimizer.state_dict(),
                     "scaler": scaler.state_dict(), "rng_state": rng_state(),
@@ -563,7 +601,8 @@ def main() -> None:
                 print(
                     f"epoch={epoch}/{args.epochs} "
                     f"loss={train_metrics['loss']:.6f} "
-                    f"train_acc={train_metrics['existence_accuracy']:.6f}",
+                    f"balanced_acc={train_metrics['existence_balanced_accuracy']:.6f} "
+                    f"pairwise_acc={train_metrics['pairwise_accuracy']:.6f}",
                     flush=True,
                 )
         # 测试仅在全部训练 epoch 完成后执行，不参与梯度、优化器更新或模型选择。
@@ -572,7 +611,8 @@ def main() -> None:
             with torch.no_grad():
                 test_metrics, _ = run_epoch(
                     model, test_loader, device, None, scaler,
-                    args.effect_weight, args.rank_weight, 0.0,
+                    args.effect_weight, args.rank_weight,
+                    args.positive_class_weight, 0.0,
                     args.max_test_batches,
                 )
         test_result = {
@@ -592,7 +632,7 @@ def main() -> None:
         else:
             print(
                 f"test_loss={test_metrics['loss']:.6f} "
-                f"test_acc={test_metrics['existence_accuracy']:.6f} "
+                f"test_balanced_acc={test_metrics['existence_balanced_accuracy']:.6f} "
                 f"test_pairwise_acc={test_metrics['pairwise_accuracy']:.6f} "
                 f"test_effect_mae={test_metrics['effect_mae']:.6f}",
                 flush=True,

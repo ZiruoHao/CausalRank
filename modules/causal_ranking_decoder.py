@@ -30,6 +30,7 @@ from typing import Dict, Tuple, Union
 import torch
 # Tensor 是张量别名，nn 提供解码网络和预测头。
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 
 class CausalRankingDecoder(nn.Module):
@@ -161,6 +162,21 @@ class CausalRankingDecoder(nn.Module):
         # g_j 抑制非父节点，a_j 区分被支持父节点之间的作用强弱。
         return existence_probability * effect_strength
 
+    def compose_log_score(
+        self,
+        existence_logits: Tensor,
+        effect_strength: Tensor,
+    ) -> Tensor:
+        """返回与最终乘积分数同序、但低概率区梯度更稳定的 log-score。"""
+
+        if existence_logits.shape != effect_strength.shape:
+            raise ValueError("存在 logits 和效应强度必须具有完全相同的形状。")
+        # float32 避免 AMP 下很小的正效应在 log 前下溢。log 是单调变换，
+        # 因而该分数的排序与 sigmoid(logit) * effect_strength 完全一致。
+        return F.logsigmoid(existence_logits.float()) + torch.log(
+            effect_strength.float().clamp_min(1e-12)
+        )
+
     def forward(
         self,
         parent_features: Tensor,
@@ -194,6 +210,7 @@ class CausalRankingDecoder(nn.Module):
             existence_probability,
             effect_strength,
         )
+        log_scores = self.compose_log_score(existence_logits, effect_strength)
 
         # 单面板调用应移除内部临时增加的 batch 维。
         if remove_batch_dimension:
@@ -201,6 +218,7 @@ class CausalRankingDecoder(nn.Module):
             existence_logits = existence_logits.squeeze(0)
             existence_probability = existence_probability.squeeze(0)
             effect_strength = effect_strength.squeeze(0)
+            log_scores = log_scores.squeeze(0)
 
         # 推理和普通评分只需要最终分数，避免外部依赖内部训练表示。
         if not return_auxiliary:
@@ -208,6 +226,7 @@ class CausalRankingDecoder(nn.Module):
         # 训练阶段返回各分支结果，由 trainer 在模块外组合监督损失。
         return {
             "scores": scores,
+            "log_scores": log_scores,
             "existence_logits": existence_logits,
             "existence_probability": existence_probability,
             "effect_strength": effect_strength,
@@ -260,6 +279,7 @@ def main() -> None:
     assert isinstance(auxiliary, dict)
     assert set(auxiliary) == {
         "scores",
+        "log_scores",
         "existence_logits",
         "existence_probability",
         "effect_strength",
@@ -274,6 +294,12 @@ def main() -> None:
     assert torch.allclose(
         auxiliary["scores"],
         auxiliary["existence_probability"] * auxiliary["effect_strength"],
+    )
+    assert torch.allclose(
+        auxiliary["log_scores"],
+        torch.log(auxiliary["scores"].float()),
+        atol=1e-6,
+        rtol=1e-6,
     )
 
     # 单面板接口返回 [D]，并应与批量调用中的同一面板一致。

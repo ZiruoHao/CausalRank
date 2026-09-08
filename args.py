@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--effect-weight", type=float, default=1.0)
     parser.add_argument("--rank-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--positive-class-weight",
+        type=float,
+        default=0.0,
+        help="BCE 正类权重；0 表示按每个 batch 的有效正负样本数自动平衡",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-cached-shards", type=int, default=1)
@@ -88,4 +94,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--log-every 必须为正数")
     if args.cross_section_chunk_size < 0:
         parser.error("--cross-section-chunk-size 不能为负数")
+    if args.positive_class_weight < 0.0:
+        parser.error("--positive-class-weight 不能为负数")
     return args

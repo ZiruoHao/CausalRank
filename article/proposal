@@ -99,23 +99,27 @@ s.
 $$
 
 #### 4.1 Panel Representation Encoder
-模型首先将候选金融特征 $X$、历史收益 $Y$ 和市场状态 $C$ 输入 Panel Representation Encoder，得到每个候选因子相对于目标收益的表示：
+模型首先将候选金融特征 $X$、历史收益 $Y$ 和市场状态 $C$ 输入 Panel Representation Encoder，分别得到候选因子的基础表示与目标收益表示：
 $$H=(h_1,\ldots,h_d),
 \qquad
-h_j\in\mathbb R^d.
+h_j\in\mathbb R^d,
+\qquad h_Y\in\mathbb R^d.
 $$
-该模块统一建模金融面板中的横截面关系、候选因子之间的交互关系、因子与未来收益之间的统计关系，以及历史时间维度上的变化信息。具体实现中可以组合横截面聚合、特征注意力和时间注意力，但在整体框架中将其视为统一的金融面板表示模块。
+该模块统一建模金融面板中的横截面联合分布和历史时间动态，但不在末端执行显式目标条件化或候选父节点竞争；这两项职责由后续 Target-Aware Parent Interaction Module 完成。为使横截面交互从第一层起即可区分候选变量与目标变量，在进入 DAG-FM 交互块之前加入 factor/target role embedding，同时不编码具体因子编号，从而保持候选因子置换等变性。
+
+截面秩变换会使不同因子的边际分布十分接近。为避免深层集合注意力和时间池化抹去可识别的目标—因子差异，编码器另外从可观测的 $(X_j,Y)$ 计算一组掩码感知的低阶依赖统计量（例如若干预先规定基函数与 $Y$ 的有符号及绝对相关性），经共享映射后作为逐因子统计残差加入 $h_j$。该残差只使用推理时同样可见的 $X,Y$ 与观测掩码，不读取因果标签或生成机制参数。
 该模块的主要作用不是直接判断因果关系，而是将原始高维金融面板转换为包含充分上下文信息的 factor-level representations，为后续因果证据分析提供统一输入。
 ```md
 class CausalRankPanelEncoder(nn.Module):
 
     def __init__(self, ...):
         # 横截面 DAG-FM 编码器
+        # 输入端因子/目标角色嵌入
         # 市场状态编码器
         # 时间位置编码
         # 时间 Transformer
-        # 因子上下文 Transformer
-        # 目标条件化网络
+        # 时间聚合模块
+        # 掩码感知的目标—因子统计残差
 
     def encode_cross_section(self, x, y):
         # 联合编码每个时间点的 X 和 Y
@@ -124,16 +128,14 @@ class CausalRankPanelEncoder(nn.Module):
         # 编码市场状态 C
 
     def encode_time(self, features, market_features, time_mask=None):
-        # 编码历史时间动态
+        # 编码并聚合历史时间动态
 
-    def contextualize_factors(self, factor_features):
-        # 建模因子间结构与冗余关系
-
-    def condition_on_target(self, factor_features, target_feature):
-        # 构造每个因子相对于 Y 的表示
+    def encode_target_factor_statistics(self, x, y, masks):
+        # 提取不会被深层池化抹去的直接统计证据
 
     def forward(self, x, y, market_state):
-        # 串联以上所有步骤并返回 [B,D,E]
+        # return factor_features: [B,D,E]
+        # return target_feature:  [B,E]
 ```
 #### 4.2 Target-Aware Parent Interaction Module
 Panel Representation Encoder 输出候选金融因子的表示
@@ -321,21 +323,22 @@ $$
 \mathcal L_{\mathrm{causal}}
 +\lambda_e\mathcal L_{\mathrm{effect}}
 +\lambda_r\mathcal L_{\mathrm{rank}}.$$
-其中，前两项用于训练最终因果排序任务，后两项分别约束不同专家形成明确的功能分工，最后一项用于避免 Router 长期退化为只使用单一 expert。
+其中三项主损失分别监督因果存在性、直接效应强度与相对排序；专家辅助损失和 Router 正则在启用 Mixture of Experts 时另行加入。
 #### 6.1 因果存在监督
 对于每个候选因子，synthetic FCM 可以直接给出其是否属于目标收益直接父节点的标签
 $$z_j=\mathbf 1[X_j\in Pa(Y)].
 $$
-Causal Ranking Decoder 中的 causal existence gate $g_j$ 使用二元交叉熵进行监督：
+Causal Ranking Decoder 中的 causal existence gate $g_j$ 使用类别平衡的二元交叉熵进行监督：
 $$\mathcal L_{\mathrm{causal}}
 =
 -\sum_j
 \left[
-z_j\log g_j
+ \alpha z_j\log g_j
 +
 (1-z_j)\log(1-g_j)
 \right].
 $$
+其中 $\alpha=N_{-}/N_{+}$ 可由训练批次或训练集统计得到，以避免直接父节点稀疏时“全部预测为非父节点”的退化解。
 该损失使模型首先学习区分直接因果因素与非直接因果因素。
 #### 6.2 因果排序监督
 Synthetic FCM 可以根据已知结构方程计算每个候选因子的真实干预强度 $\tau_j$。因此，对于任意满足
@@ -344,20 +347,25 @@ $$
 的候选因子对，希望模型最终输出满足
 $$s_j>s_k.
 $$
-采用加权 pairwise ranking loss：
+推理阶段仍使用 $s_j=g_ja_j$。训练阶段对其采用单调等价的稳定对数分数
+$$
+\ell_j=\log g_j+\log a_j=\log s_j,
+$$
+从而避免 $g_j$ 很小时乘法门控同时压低排序梯度。采用加权 pairwise ranking loss：
 $$\mathcal L_{\mathrm{rank}}
 =
+\frac{1}{\sum_{\tau_j>\tau_k}w_{jk}}
 \sum_{\tau_j>\tau_k}
 w_{jk}
 \log
 \left(
-1+\exp(-(s_j-s_k))
+1+\exp(-(\ell_j-\ell_k))
 \right),
 $$
 其中
 $$w_{jk}=|\tau_j-\tau_k|.
 $$
-真实干预效应差异越大的因子对，在训练中获得越高权重。该损失直接优化最终因果因子的相对排序，而不要求模型精确恢复所有干预效应的绝对数值。
+由于对数变换严格单调，$\ell_j$ 与最终输出 $s_j$ 给出完全相同的排序。真实干预效应差异越大的因子对，在训练中获得越高权重。该损失直接优化最终因果因子的相对排序，而不要求模型精确恢复所有干预效应的绝对数值。
 ### 7. Inference 阶段（Maybe）
 #### 7.1递归因子搜索
 训练完成后固定 CausalRank 参数 $\theta^\ast$。推理阶段输入真实金融面板
