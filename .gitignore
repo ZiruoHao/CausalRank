@@ -1,0 +1,21 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Large source datasets and generated episode shards are reproducible artifacts.
+/data/
+/data_generation/*/
+
+# Training products and crash dumps
+/runs/
+*.pt
+*.pth
+core
+core.*
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/

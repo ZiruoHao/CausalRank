@@ -1,0 +1,638 @@
+# CausalRank-ICLR2027
+# proposal
+
+## 研究背景
+虽然当前机器学习相关方法已广泛应用于量化金融中的收益预测、因子挖掘与资产定价，但现有方法通常依据相关性、预测精度或特征重要性对金融因子进行筛选与排序。在高维、强相关、非平稳的金融环境中，具有较高预测能力的变量并不一定是未来收益的真实因果驱动因素，基于此的方法通常在跨时期和分布变化下可能缺乏稳定性与经济解释。
+与此同时，近年来基于模拟结构因果模型进行预训练的causal discovery 方法表明，可以通过大规模生成具有已知因果结构的虚拟数据，使模型学习从观测数据直接推断因果关系。DAG-FM 等工作进一步证明，基于合成 SCM 训练的模型能够在推理阶段直接处理未见过的真实观测数据，并通过目标节点的父节点预测实现局部因果识别。
+基于这一思路，本研究拟将叶子节点的父节点搜索算法扩展为更符合金融应用需求的因子排序问题。我们关注给定历史股票特征、市场状态与后续收益数据时，如何识别未来收益的直接因果驱动因素，并依据其结构性干预效应给出连续排序。该框架旨在同时区分预测性相关因素与真正的因果收益特征，并进一步检验这种因果排序在因子选择、因子加权和资产配置中的经济价值。
+## 问题建模
+设市场中包含 $N$ 只股票，在长度为 $T$ 的历史窗口内，每只股票具有 $D$ 个候选金融特征。记股票特征张量为
+$$X\in\mathbb{R}^{N\times T\times D},
+$$
+
+其中 $X_{i,t,j}$ 表示股票 $i$ 在时间 $t$ 上第 $j$ 个候选因子的观测值。$N$ 对应横截面股票数量，$T$ 对应历史时间长度，$D$ 对应候选因子数量。本文主要考虑 $N>1$ 的横截面资产收益场景。
+对于每个股票及时间点，定义未来 $t'$ 期超额收益为目标变量
+$$Y_{i,t}=R^{e}_{i,t+t'},
+$$
+并记历史收益观测为
+$$Y\in\mathbb{R}^{N\times T}.
+$$
+当 $t'=1$ 时即预测单期超额收益。此外，可引入市场波动率、利率、市场收益等状态变量
+$$C\in\mathbb{R}^{T\times K},
+$$
+用于描述不同时间段的市场环境及潜在机制变化。
+因此，在时间 $t$ 进行推理时，模型输入由历史可观测的股票特征、对应的后续已实现收益以及市场状态共同组成，即
+$$\mathcal P_t=(X_t,Y_t,C_t).
+$$
+模型针对 $D$ 个候选金融因子输出连续的因果排序得分
+$$s=(s_1,s_2,\ldots,s_D)\in\mathbb{R}^{D},
+$$
+其中 $s_j$ 表示第 $j$ 个金融因子对于未来股票收益的因果相关强度。根据得分得到因子排序
+$$X_{\pi_1}\succ X_{\pi_2}\succ\cdots\succ X_{\pi_D},
+$$
+其中
+$$s_{\pi_1}\geq s_{\pi_2}\geq\cdots\geq s_{\pi_D}.
+$$
+最终模型的核心任务是从历史观测金融数据中识别并排序未来收益的直接因果驱动因素，而非恢复完整因果图。
+## 算法设计
+### 总体框架
+CausalRank 采用基于合成 Functional Causal Model（FCM）的预训练范式。训练阶段通过随机生成具有已知因果结构和结构方程的金融面板数据，获得每个候选因子相对于未来收益的真实直接因果关系及干预效应排序，并训练一个从观测数据直接预测因果排序的模型。推理阶段输入历史金融数据即可输出各候选因子的因果排序得分。
+这一结构基于 amortized causal discovery 中利用大规模合成 SCM 进行预训练、推理阶段直接处理真实观测数据的思想，但本文的目标由完整 DAG 恢复转化为面向未来收益的因果因子排序。
+### 合成训练数据生成
+每个训练样本称为一个 episode。主任务中的 episode 必须是日历月对齐的金融面板：同一时间下标 $t$ 对所有股票表示同一个自然月。给定连续 $T$ 个月和 $N$ 只股票，episode 包含
+$$X\in\mathbb R^{N\times T\times D},\qquad
+Y\in\mathbb R^{N\times T}.
+$$
+这里 $X_{i,t,j}$ 是在预测 $Y_{i,t}$ 时已经可得的第 $j$ 个特征，$Y_{i,t}$ 是随后一期或随后 $t'$ 期的收益。不同股票各自截取的 60 期轨迹不能随机拼成主任务的横截面，因为拼接后相同的 $t$ 不再对应相同月份；这类非对齐序列仅用于单资产时间编码器预训练或消融实验。
+为了覆盖模拟数据的因果可识别性和真实金融数据的分布特征，训练采用两类互补 episode。
+第一类：全合成 SCM episode。 在候选特征之间生成稀疏有向无环图，并从中选择少量节点作为 $Y$ 的直接父节点。图分布混合 Erdős–Rényi、scale-free 和 block-structured graph。候选特征由动态 FCM 生成：
+$$X_{i,t,j}=f_j\!\left(
+X_{i,t,Pa_j},
+X_{i,t-1,La_j},
+U^X_{i,t,j}
+\right),
+$$
+其中同时刻父节点按照 DAG 的拓扑顺序生成，$La_j$ 表示滞后父节点。目标变量由
+$$Y_{i,t}=f_Y\!\left(X_{i,t,Pa(Y)},U^Y_{i,t}\right)
+$$
+生成。同一个 episode 内所有股票和月份共享图结构与结构函数参数，但具有各自的外生噪声。结构函数随机覆盖线性、非线性、交互、阈值、异方差和状态依赖机制，噪声分布覆盖 Gaussian、Student-$t$ 和 Laplace，并随机改变图稀疏度、信噪比、变量尺度及机制强度。由于完整 SCM 已知，这类数据既可以监督 $Y$ 的直接父节点，也可用于单独研究祖先、后代、proxy、共同原因和总效应。
+第二类：半合成金融 episode。 $X$ 来自真实且按日历月对齐的股票特征面板，只有目标机制 $f_Y$、外生噪声和监督标签由程序生成：
+$$Y_{i,t}=f_Y\!\left(\widetilde X_{i,t,Pa(Y)},U^Y_{i,t}\right).
+$$
+$\widetilde X$ 是在保留缺失掩码的前提下得到的完整数值输入。父节点从候选特征中独立抽取，不能优先选择缺失较少的变量，否则缺失率本身会泄露父节点标签。半合成数据保留真实特征的边际分布、相关结构、时间依赖和缺失模式，但只提供关于所生成目标方程的直接因果真值，并不声称知道真实 $X$ 之间的因果图。
+两类 episode 都加入高相关非父节点、共同原因以及弱父节点与强预测 proxy 共存的 hard-negative cases。全合成数据通过 SCM 明确生成这些结构；半合成数据优先利用真实 $X$ 中自然存在的高相关非父节点，不在缺失位置注入父节点信号，以免模型通过异常缺失模式识别标签。
+训练采用两阶段策略：第一阶段使用全合成 SCM 预训练，使模型学习广泛的结构机制；第二阶段使用半合成金融 episode 适配真实数据分布，并保留一部分全合成 episode 进行 replay，防止模型遗忘结构性困难样本。第二阶段可默认使用 $70\%$ 半合成和 $30\%$ 全合成，具体比例由验证集选择。
+
+### 3. 因果排序监督
+由于 synthetic FCM 中真实结构方程已知，可以直接计算第 $j$ 个候选因子的直接干预效应：
+$$\tau_j
+=
+\mathbb E
+\left[
+\left|
+f_Y(X_{-j},q_j^{H},C,U_Y)
+-
+f_Y(X_{-j},q_j^{L},C,U_Y)
+\right|
+\right],
+$$
+其中 $q_j^{H}$ 和 $q_j^{L}$ 分别由该 synthetic episode 中 $X_j$ 的经验高、低分位数计算得到。
+同时定义
+$$z_j=\mathbf 1[X_j\in Pa(Y)]
+$$
+作为直接因果关系标签。
+因此每个训练 episode 的主要监督信息为
+$$(X,Y,C,z,\tau).
+$$
+即因子、目标、环境变量、因果存在标签、因果效应标签。
+### 4. 模型内部 Data Pipeline
+CausalRank 的模型内部主要由三个模块组成：
+$$(X,Y,C)
+\rightarrow
+\boxed{\text{Panel Representation Encoder}}
+\rightarrow
+\boxed{\text{Target-Aware Parent Interaction Module}}
+\rightarrow
+\boxed{\text{Causal Ranking Decoder}}
+\rightarrow
+s.
+$$
+
+#### 4.1 Panel Representation Encoder
+模型首先将候选金融特征 $X$、历史收益 $Y$ 和市场状态 $C$ 输入 Panel Representation Encoder，得到每个候选因子相对于目标收益的表示：
+$$H=(h_1,\ldots,h_d),
+\qquad
+h_j\in\mathbb R^d.
+$$
+该模块统一建模金融面板中的横截面关系、候选因子之间的交互关系、因子与未来收益之间的统计关系，以及历史时间维度上的变化信息。具体实现中可以组合横截面聚合、特征注意力和时间注意力，但在整体框架中将其视为统一的金融面板表示模块。
+该模块的主要作用不是直接判断因果关系，而是将原始高维金融面板转换为包含充分上下文信息的 factor-level representations，为后续因果证据分析提供统一输入。
+```md
+class CausalRankPanelEncoder(nn.Module):
+
+    def __init__(self, ...):
+        # 横截面 DAG-FM 编码器
+        # 市场状态编码器
+        # 时间位置编码
+        # 时间 Transformer
+        # 因子上下文 Transformer
+        # 目标条件化网络
+
+    def encode_cross_section(self, x, y):
+        # 联合编码每个时间点的 X 和 Y
+
+    def encode_market_state(self, market_state):
+        # 编码市场状态 C
+
+    def encode_time(self, features, market_features, time_mask=None):
+        # 编码历史时间动态
+
+    def contextualize_factors(self, factor_features):
+        # 建模因子间结构与冗余关系
+
+    def condition_on_target(self, factor_features, target_feature):
+        # 构造每个因子相对于 Y 的表示
+
+    def forward(self, x, y, market_state):
+        # 串联以上所有步骤并返回 [B,D,E]
+```
+#### 4.2 Target-Aware Parent Interaction Module
+Panel Representation Encoder 输出候选金融因子的表示
+$$H=(h_1,\ldots,h_D),
+\qquad
+h_j\in\mathbb R^d,
+$$
+以及目标收益表示
+$$h_Y\in\mathbb R^d.
+$$
+在此基础上，Target-Aware Parent Interaction Module 针对每个候选因子 $X_j$，显式建模其与目标收益 $Y$ 以及其他候选因子之间的相对结构关系。该模块的目标不是判断 $X_j$ 与 $Y$ 是否具有较强相关性，而是在其他候选变量同时存在的条件下，提取能够支持 $X_j\rightarrow Y$ 这一直接父节点关系的结构证据。
+该模块主要包含三个步骤。
+##### 4.2.1 Target Relation Extraction
+首先，对每个候选因子 $X_j$ 与目标收益 $Y$ 进行显式交互，得到目标条件化表示：
+$$r_j^Y
+=
+\phi_Y(h_j,h_Y).
+$$
+具体实现中，将候选因子表示和目标表示投影到共享空间，并结合二者的差异、乘积以及双线性交互信息：
+$$q_j=W_qh_j,
+\qquad
+k_Y=W_kh_Y.
+$$
+进一步构造逐维交互：
+$$b_j=q_j\odot k_Y,
+$$
+并通过可学习门控提取与当前候选因子相关的目标信息。最终得到：
+$$R^Y
+=
+(r_1^Y,\ldots,r_D^Y).
+$$
+该表示描述每个候选因子相对于目标收益所表现出的统计与结构关系，但此阶段尚不能区分真实直接父节点和高度相关的非父节点。
+##### 4.2.2 Target-Conditioned Conditional Competition
+为了进一步区分直接因果因素与高度相关的替代变量，模型在已经经过目标条件化的表示空间中，对候选因子进行 leave-one-out 条件竞争。
+对于第 $j$ 个候选因子，仅允许其读取其他候选因子的目标条件化表示：
+$$R_{-j}^Y
+=
+\{r_k^Y:k\neq j\}.
+$$
+条件竞争上下文定义为：
+$$c_j
+=
+\operatorname{Attention}
+\left(
+r_j^Y,
+R_{-j}^Y,
+R_{-j}^Y
+\right).
+$$
+注意力矩阵采用对角屏蔽，使第 $j$ 个候选因子不能在该分支直接读取自身。
+为了降低与目标几乎无关的候选变量对条件上下文的干扰，可以进一步学习目标相关性门控：
+$$\alpha_k
+=
+\sigma
+\left(
+f_{\mathrm{rel}}(r_k^Y)
+\right),
+$$
+并使用
+$$\hat r_k^Y
+=
+\alpha_k r_k^Y
+$$
+作为条件竞争中的键和值。
+因此，该模块实际比较的是：
+> 当前候选因子相对于 $Y$ 的关系，与其他同样表现出目标相关性的候选因子之间的竞争关系。
+这使模型能够针对金融数据中常见的高度相关变量进行结构性区分。例如，当
+$$X_c\rightarrow Y
+$$
+且另一个候选因子 $X_p$ 与 $X_c$ 高度相关，但满足
+$$X_p\not\rightarrow Y,
+$$
+模型需要利用候选变量之间的联合结构，而不是仅根据 $X_p$ 与 $Y$ 的预测相关性进行判断。
+##### 4.2.3 Parent Evidence Fusion
+最后，将候选因子的直接目标关系和条件竞争上下文进行融合。
+对于第 $j$ 个候选因子，构造：
+$$r_j^Y,
+\qquad
+c_j,
+\qquad
+r_j^Y-c_j,
+\qquad
+r_j^Y\odot c_j.
+$$
+其中，
+$$r_j^Y-c_j
+$$
+用于描述当前候选因子在考虑其他候选变量后仍然保留的差异性证据，而
+$$r_j^Y\odot c_j
+$$
+用于描述当前候选因子与条件上下文之间的相容关系。
+最终得到父节点感知表示：
+$$e_j
+=
+\phi_P
+\left(
+r_j^Y,
+c_j,
+r_j^Y-c_j,
+r_j^Y\odot c_j
+\right).
+$$
+所有候选因子共享同一套参数，因此模块能够以统一方式处理不同金融因子，并输出：
+$$E=(e_1,\ldots,e_D),
+\qquad
+e_j\in\mathbb R^d.
+$$
+该模块本身不直接输出父节点概率或最终因果得分，而是将目标关系与候选变量之间的条件竞争信息压缩为 parent-aware representations。随后，$E$ 被输入 Causal Ranking Decoder，用于进一步预测直接因果存在性和连续因果强度。
+整体过程可以表示为：
+$$\boxed{
+H,h_Y
+\rightarrow
+\text{Target Relation Extraction}
+\rightarrow
+R^Y
+\rightarrow
+\text{Target-Conditioned Conditional Competition}
+\rightarrow
+C
+\rightarrow
+\text{Parent Evidence Fusion}
+\rightarrow
+E
+}
+$$
+其中该模块对应本文的核心目标：在给定目标收益的情况下，从高维且高度相关的金融候选变量中提取能够支持直接父节点关系的结构性证据。
+```md
+class TargetAwareParentInteraction(nn.Module):
+
+    def __init__(self, ...):
+        # target-factor interaction
+        # factor-factor contextual interaction
+        # parent-aware representation network
+
+    def target_interaction(self, factor_features, target_feature):
+        # 建模每个候选因子与目标 Y 的关系
+        pass
+
+    def conditional_context(self, factor_features):
+        # 利用其他候选因子形成条件上下文
+        pass
+
+    def fuse(self, factor_target_features, conditional_features):
+        # 融合 target interaction 与 conditional context
+        # 得到 parent-aware representation
+        pass
+
+    def forward(self, factor_features, target_feature):
+        # factor_features: [B, D, E]
+        # target_feature:  [B, E]
+        # return:          [B, D, E]
+        pass
+```
+
+#### 4.3 Causal Ranking Decoder
+融合后的 causal representation $e_j\in\mathbb R^d.$ 输入 Causal Ranking Decoder。
+模型首先产生内部 causal existence gate：
+$$g_j=\sigma(f_g( e_j)),
+$$
+用于衡量当前观测数据对 $X_j\rightarrow Y$ 这一直接因果关系的支持程度。
+随后估计对应的连续因果强度：
+$$a_j=\operatorname{softplus}(f_a(e_j)),$$
+并得到最终因果排序得分：
+$$s_j=g_j\cdot a_j.
+$$
+模型最终仅向外输出
+$$s=(s_1,\ldots,s_D),
+$$
+并按照 $s_j$ 的大小对候选金融因子进行排序。
+---
+
+### 5. Mixture of Experts 的训练方式
+三个 experts 主要基于相同的 synthetic FCM 数据
+$$(X,Y,C,z,\tau),
+$$
+进行学习，但是需要增加一些额外标签，对于每个候选变量，记录其是否属于直接原因、与直接原因高度相关的 proxy、共同原因相关变量或无关变量。
+Conditional Structural Expert 同时增加针对困难因果结构的辅助监督。对于真实 direct cause 与高相关 proxy，可以构造配对训练样本，使模型学习在预测相关性较强的情况下仍然优先识别直接因果因素。其训练信息主要来源于 $z_j$、$\tau_j$ 以及额外的变量结构角色标签。
+Invariant Expert 对于同一个 synthetic panel，在 $T$ 维度采样不同历史窗口，在 $N$ 维度采样不同股票子集，构造多个输入视图。由于这些子样本来源于同一个底层 FCM，因此共享相同的真实因果关系和因果强度标签。训练时要求同一候选因子在不同时间窗口和不同横截面子样本中的因果表示或排序保持一致，从而学习跨时间和横截面的稳定因果证据。
+General Causal Expert 不增加额外辅助标签，直接通过主要的 causal identification loss 和 causal ranking loss 进行训练，用于学习无法由明确结构约束覆盖的复杂因果模式。
+### 6. 训练目标
+CausalRank 采用主任务监督与专家辅助监督联合训练。总体训练目标写为
+$$
+\mathcal L
+=
+\mathcal L_{\mathrm{causal}}
++\lambda_e\mathcal L_{\mathrm{effect}}
++\lambda_r\mathcal L_{\mathrm{rank}}.$$
+其中，前两项用于训练最终因果排序任务，后两项分别约束不同专家形成明确的功能分工，最后一项用于避免 Router 长期退化为只使用单一 expert。
+#### 6.1 因果存在监督
+对于每个候选因子，synthetic FCM 可以直接给出其是否属于目标收益直接父节点的标签
+$$z_j=\mathbf 1[X_j\in Pa(Y)].
+$$
+Causal Ranking Decoder 中的 causal existence gate $g_j$ 使用二元交叉熵进行监督：
+$$\mathcal L_{\mathrm{causal}}
+=
+-\sum_j
+\left[
+z_j\log g_j
++
+(1-z_j)\log(1-g_j)
+\right].
+$$
+该损失使模型首先学习区分直接因果因素与非直接因果因素。
+#### 6.2 因果排序监督
+Synthetic FCM 可以根据已知结构方程计算每个候选因子的真实干预强度 $\tau_j$。因此，对于任意满足
+$$\tau_j>\tau_k
+$$
+的候选因子对，希望模型最终输出满足
+$$s_j>s_k.
+$$
+采用加权 pairwise ranking loss：
+$$\mathcal L_{\mathrm{rank}}
+=
+\sum_{\tau_j>\tau_k}
+w_{jk}
+\log
+\left(
+1+\exp(-(s_j-s_k))
+\right),
+$$
+其中
+$$w_{jk}=|\tau_j-\tau_k|.
+$$
+真实干预效应差异越大的因子对，在训练中获得越高权重。该损失直接优化最终因果因子的相对排序，而不要求模型精确恢复所有干预效应的绝对数值。
+### 7. Inference 阶段（Maybe）
+#### 7.1递归因子搜索
+训练完成后固定 CausalRank 参数 $\theta^\ast$。推理阶段输入真实金融面板
+$$(X,Y,C),
+$$
+并初始化候选集合
+$$\mathcal C^{(0)}
+=
+\{X_1,\ldots,X_D\},
+$$
+以及已选择因子集合
+$$\mathcal S^{(0)}=\varnothing.
+$$
+在第 $r$ 轮，首先使用训练完成的 CausalRank Scoring Model 对当前候选集合进行统一评分：
+$$s^{(r)}
+=
+F_{\theta^\ast}
+\left(
+X,Y,C,\mathcal C^{(r)}
+\right).
+$$
+模型选择当前得分最高且尚未被选择的候选因子：
+$$F_r
+=
+\arg\max_{F\in\mathcal C^{(r)}}s_F^{(r)},
+$$
+并更新已发现因子集合：
+$$\mathcal S^{(r+1)}
+=
+\mathcal S^{(r)}
+\cup
+\{F_r\}.
+$$
+被选择的变量不再参与后续候选竞争，但仍保留在原始金融面板中作为条件信息，因此递归搜索不会通过物理删除变量改变其他候选因子的观测关系。
+完成当前轮选择后，Factor Combination Module 从尚未被选择的原始候选因子中构造新的组合候选。第一版采用标准化后的简单线性组合：
+$$Z_{jk}^{+}
+=
+\frac{\tilde X_j+\tilde X_k}{\sqrt 2},
+\qquad
+Z_{jk}^{-}
+=
+\frac{\tilde X_j-\tilde X_k}{\sqrt 2}.
+$$
+组合变量被视为新的候选金融因子，与剩余原始因子共同形成下一轮候选池：
+$$\mathcal C^{(r+1)}
+=
+\operatorname{Update}
+\left(
+\mathcal C^{(r)},
+F_r,
+\mathcal Z^{(r+1)}
+\right).
+$$
+更新后的候选集合重新从 Panel Representation Encoder 输入同一个 CausalRank Scoring Model，
+$$\mathcal S_K
+=
+\{F_1,\ldots,F_K\}.
+$$
+其中每个 $F_k$ 可以是原始因子 $X_j$，也可以是递归过程中构造出的组合因子 $Z_{jk}^{\pm}$。本文暂定搜索 Top-$5$ causal factors。
+#### 7.2. 合成测试数据
+基础训练数据仍按照前述 synthetic FCM 生成，不需要为了组合模块增加专门的训练样本。为了单独评价模型在 inference 阶段发现组合因子的能力，额外构建一组不参与训练的 synthetic composite benchmark。
+在测试环境中，首先按照与训练阶段一致的方法生成原始候选变量
+$$X_1,\ldots,X_D.
+$$
+随后随机选择两个原始变量 $X_j,X_k$，构造一个确定性的组合节点：
+$$Z_{jk}^{+}
+=
+\frac{\tilde X_j+\tilde X_k}{\sqrt 2}
+$$
+或
+$$Z_{jk}^{-}
+=
+\frac{\tilde X_j-\tilde X_k}{\sqrt 2}.
+$$
+在真实 synthetic SCM 中加入
+$$X_j,X_k
+\rightarrow
+Z_{jk}
+\rightarrow
+Y,
+$$
+并使未来收益结构方程直接依赖组合节点：
+$$Y
+=
+f_Y
+\left(
+Z_{jk},
+X_{Pa(Y)},
+C,
+U_Y
+\right).
+$$
+这里 $Z_{jk}$ 是 $Y$ 的真实直接父节点，而其组成变量 $X_j,X_k$ 仅通过组合节点间接影响 $Y$。
+关键在于，模型初始输入的候选集合中不提供 $Z_{jk}$，只提供原始变量 $X_j,X_k$。因此第一次评分只能处理原始因子。递归 Factor Combination Module 随后根据原始变量构造候选 $Z_{jk}^{\pm}$，并重新送入已经训练完成的 CausalRank scorer。
+如果模型能够在新的候选集合中将真实组合
+$$Z_{jk}
+$$
+赋予较高 causal ranking score，并最终选择进入 Top-$K$，则说明模型具有从单因子评分能力向组合因子发现进行 zero-shot 泛化的能力。
+例如测试环境可以设置为
+$$X_1,X_2
+\rightarrow
+Z_{12}^{+}
+=
+\frac{\tilde X_1+\tilde X_2}{\sqrt 2}
+\rightarrow
+Y,
+$$
+同时加入与 $Y$ 高度相关但无直接结构作用的其他变量。初始阶段模型只能看到
+$$X_1,X_2,X_3,\ldots,X_D,
+$$
+而递归组合阶段才出现
+$$Z_{12}^{+}.
+$$
+理想结果是在重新评分后得到
+$$s_{Z_{12}^{+}}
+>
+s_{X_1},
+\qquad
+s_{Z_{12}^{+}}
+>
+s_{X_2},
+$$
+并最终恢复真实 composite causal factor。
+评价时可以分别报告普通 synthetic benchmark 上的单因子 causal ranking performance，以及 composite benchmark 上的：
+- Composite Hit@K
+- 组合因子的平均排名
+- Top-$K$ causal set recovery
+同时比较
+$$\text{CausalRank without combination}
+$$
+和
+$$\text{CausalRank + recursive combination},
+$$
+从而直接量化 inference-time factor combination 对因果因素发现能力的增益。
+整体实验逻辑为：
+$$\boxed{
+\text{训练阶段}
+=
+\text{只学习 causal ranking}
+}
+$$
+以及
+$$\boxed{
+\text{组合 benchmark}
+=
+\text{测试训练好的 ranking model 能否泛化到新构造的 composite candidates}
+}
+$$
+如果模型在没有接受组合因子专门训练的情况下仍能够发现真实 composite causal factors，则可以进一步说明 CausalRank scorer 对新的候选因子形式具有一定的 zero-shot generalization 能力。
+
+
+### 8.实验设计
+#### 8.1 数据生成流程
+本节的数据生成同时服务于全合成预训练和半合成金融适配。两种数据具有完全相同的模型接口，但来源、可提供的因果真值和存储方式不同。
+步骤 1：按日历时间划分真实数据。
+在构造任何窗口之前，先按月份把完整样本划分为训练期、验证期和测试期。长度为 $T=60$ 的窗口不得跨越划分边界，相邻划分之间设置与预测期限及窗口重叠相匹配的 embargo。所有需要估计参数的插补器、尺度变换和机制超参数经验分布只能在训练期拟合。验证期只用于选择模型与数据生成超参数，测试期在最终评估前保持封存。
+现有由单只股票各自连续记录切成的 53,454 条 60 期序列没有日历横截面对齐，因此不直接随机组合为主任务 episode。它们可以单独用于单资产时间模块预训练，以及“对齐面板与非对齐轨迹”的消融实验。
+步骤 2：构造日历月对齐的真实面板。
+对于半合成 episode $m$，从某一数据划分中选择连续 $T=60$ 个自然月，再从窗口内的股票池抽取至多 $N$ 只股票。对选中的股票建立稠密索引：
+$$X_{obs}^{(m)}\in(\mathbb R\cup\{\mathrm{NaN}\})^{N\times T\times D},
+\qquad D=94.
+$$
+同时保存两类含义不同的掩码：
+$$A_{i,t}=\mathbf 1[\text{股票 }i\text{ 在月份 }t\text{ 存在一条原始记录}],
+\qquad A\in\{0,1\}^{N\times T},
+$$
+$$M_{i,t,j}=\mathbf 1[A_{i,t}=1\text{ 且 }X_{i,t,j}\text{ 被观测}],
+\qquad M\in\{0,1\}^{N\times T\times D}.
+$$
+$A=0$ 表示整个股票—月份不存在，$A=1,M=0$ 表示该股票—月份存在但某个特征缺失，两者不能混为一种缺失。若一个 batch 中的 $N$ 可变，则补齐到 $N_{max}$，补齐位置同样令 $A=0$。
+在每个月的有效横截面内对特征进行预先规定的变换，例如按截面秩映射到 $[-1,1]$。随后使用仅由训练期确定的规则对特征缺失进行插补，得到有限数值张量
+$$\widetilde X^{(m)}\in\mathbb R^{N\times T\times D}.
+$$
+秩变换后的缺失值可用 0 表示当月截面中位数；所有插补仍保留 $M$，不存在的股票—月份置 0 并由 $A$ 屏蔽。模型的横截面聚合、时间注意力、目标损失和所有 episode 统计量都必须使用相应掩码。
+若使用市场状态，则同一自然月的所有股票共享
+$$C_t\in\mathbb R^K,
+\qquad C\in\mathbb R^{T\times K}.
+$$
+若没有可靠的市场状态数据，设 $K=0$ 并在整个实验中一致地省略 $C$，不能把非对齐序列各自的月份变量写成共享的 $C_t$。
+步骤 3：生成全合成或半合成的候选特征。
+对于全合成 episode，采样特征 DAG、滞后边、市场过程、结构函数和噪声，再按拓扑顺序生成 $X$。缺失过程必须在完整 $X$ 生成后独立采样，并用真实训练数据估计的上市/退市覆盖率、特征缺失率及缺失持续性进行校准；缺失概率不能依赖后续采样的父节点标签。
+对于半合成 episode，直接使用步骤 2 得到的 $(\widetilde X,A,M,C)$，不假定真实特征之间的因果方向。真实的未来收益不用于构造 $z$ 和 $\tau^{dir}$，只在独立的下游资产定价实验中使用。
+步骤 4：独立采样目标父节点与困难负样本。
+从 $D$ 个候选特征中采样稀疏父节点集合
+$$Pa(Y)\subseteq\{1,\ldots,D\},
+$$
+并定义
+$$z_j=\mathbf 1[j\in Pa(Y)],
+\qquad z\in\{0,1\}^{D}.
+$$
+父节点抽样分布与当前 episode 的特征缺失率相互独立，禁止“优先选择观测完整特征”。若某个窗口整体有效样本不足，应依据预先设定且不依赖 $Pa(Y)$ 的窗口质量规则重采样整个 episode，或使用训练期的全局分位数；不能在看到父节点身份后有选择地丢弃样本。
+困难负样本分两种构造。全合成数据显式生成父节点的 noisy proxy、共同原因或后代，但这些变量不进入 $f_Y$。半合成数据在未被选为父节点的真实特征中标记与父节点高度相关的变量作为 hard negative，而不修改其缺失位置或观测值。由此得到可选的
+$$h^{neg}\in\{0,1\}^{D}
+$$
+和对应的父节点—困难负样本配对，供重加权及专项评估使用。
+步骤 5：生成目标因果机制与观测结果。
+每个 episode 随机选择线性非高斯、非线性加性噪声、异方差、后非线性、阈值、状态依赖或交互机制，统一写为
+$$Y_{i,t}^{raw}=f_Y\!\left(
+\widetilde X_{i,t,Pa(Y)},
+C_t,
+U^Y_{i,t}
+\right).
+$$
+同一 episode 的全部有效股票—月份共享 $Pa(Y)$、函数类型和机制参数，$U^Y_{i,t}$ 则按股票和月份采样。只在 $A_{i,t}=1$ 的位置定义并使用 $Y_{i,t}$。若对 $Y^{raw}$ 标准化，标准化统计量仅由该 episode 的有效位置计算并保存，以便事实和反事实结果使用完全相同的变换。
+步骤 6：计算受控直接效应监督。
+本文的主要目标是排序 $Y$ 的直接父节点，因此将监督量明确记为 $\tau^{dir}$。对于特征 $j$，低、高干预值取自该 episode 有效观测的 20% 和 80% 分位数；有效观测不足时使用训练期预先估计的分位数：
+$$q_j^L=Q_{0.2}(X_j),
+\qquad
+q_j^H=Q_{0.8}(X_j).
+$$
+保持 $X_{-j}$、$C$ 和同一份外生噪声 $U^Y$ 不变，只替换目标结构方程中 $X_j$ 的输入，得到
+$$Y_{i,t}^{L}=f_Y(X_{i,t,-j},X_{i,t,j}=q_j^L,C_t,U^Y_{i,t}),
+$$
+$$Y_{i,t}^{H}=f_Y(X_{i,t,-j},X_{i,t,j}=q_j^H,C_t,U^Y_{i,t}).
+$$
+受控直接效应强度定义为
+$$\tau_j^{dir}
+=
+\frac{
+\sum_{i,t}A_{i,t}\left|Y_{i,t}^{H}-Y_{i,t}^{L}\right|
+}{
+\sum_{i,t}A_{i,t}
+}.
+$$
+事实结果与两次反事实结果必须复用相同的噪声以及相同的 $Y$ 标准化参数。对不进入 $f_Y$ 的变量规定
+$$\tau_j^{dir}=0.
+$$
+于是主要排序标签为
+$$\pi^*=\operatorname{argsort}(-\tau^{dir}).
+$$
+该操作保持其他候选变量不变，测量的是受控直接效应，而不是沿 $X$ 的因果图向后传播的总效应。全合成 SCM 可以额外执行完整的 $do(X_j)$ 并保存 $\tau_j^{tot}$，但 $\tau^{tot}$ 必须作为独立辅助任务和指标，不能与直接父节点标签 $z$ 混用。半合成数据因未知真实 $X$ 图，不提供可识别的总效应真值。
+步骤 7：确定性在线生成与分层存储。
+为避免为大量 episode 重复保存相同的真实特征，数据采用“基础数据、episode 规格、可选缓存”三层结构。
+1. 基础真实数据按长表保存为按月份分区的 Parquet，至少包括 date、stock_id、94 个特征以及必要元数据；市场状态单独保存。数据划分边界、特征顺序、预处理统计量和数据校验值写入 manifest。
+2. 每个 episode 只在 Parquet 规格表中保存数据来源、窗口起止月份、股票 ID、$Pa(Y)$、机制类型与参数、干预分位数、hard-negative 配对及所有随机种子。给定规格必须能够确定性重建 $(\widetilde X,Y,C,A,M,z,\tau^{dir})$。
+3. 全合成 episode 原则上也只保存 SCM 参数与随机种子并在线生成。若吞吐量要求离线缓存，则使用分片 Zarr/Arrow，而不是单个超大 CSV；缓存中按统一接口保存下列数组：
+```plaintext
+X                       float32 [N,T,D]
+Y                       float32 [N,T]
+C                       float32 [T,K]       # K=0 时省略
+asset_mask              bool    [N,T]
+feature_mask            bool    [N,T,D]
+
+z                       bool    [D]
+tau_direct              float32 [D]
+tau_total               float32 [D]         # 仅全合成辅助任务，可选
+
+parent_indices
+q_low                    float32 [D]
+q_high                   float32 [D]
+hard_negative_mask       bool    [D]         # 可选
+hard_negative_pairs                             # 可选
+
+source_type              # full_synthetic / semi_synthetic
+mechanism_type
+mechanism_parameters
+scm_seed
+noise_seed
+missingness_seed
+
+stock_ids                # 半合成数据
+window_start
+window_end
+split                     # train / validation / test
+
+```
+
+# 中文版初稿
+## Intro
+如今机器学习已经广泛用于收益预测、因子挖掘和资产定价。现有方法通常根据相关性、预测精度或特征重要性筛选金融因子。这些方法可以找到具有预测能力的变量，但预测能力并不能保证这些变量直接影响未来收益。在金融市场中，共同市场状态、行业暴露和因子之间的高度相关性都会产生大量 proxy。因此，一个变量即使具有很强的预测能力，也可能只是其他真实驱动因素的替代信号即混杂因子。当底层市场分布发生偏移时，基于混在因子的预测往往会导致模型失效与性能坍塌。这使金融因子发现面临一个更直接的问题：在给定大量候选特征时，哪些变量直接影响未来收益，它们的影响又有多强。
+近年来，因果基础模型为因果发现提供了新的技术路径。DAG-FM 等方法通过在大量具有不同图结构和生成机制的合成 FCM 上进行预训练，使模型学习可迁移的因果推断能力。完成预训练后，模型可以处理未见过的观测数据，并输出对应的因果结构。这种范式将因果发现从针对单个数据集的重复搜索，转化为可预训练的快速推理。在金融预测任务中，目标聚焦于单一目标变量即未来超额收益。实际因子投资通常不需要恢复完整因果图，而是需要识别最重要的收益驱动因素，并按照其因果作用进行排序。这样的结果可以直接用于因子筛选、因子加权和资产配置。 同时在因果发现的基础上衍生出了更进一步针对因果效应的排序任务。
+基于这类工作启发和针对相关问题的思考，我们提出 CausalRank，一个面向金融因果因子排序的基础模型。试图将因果发现从传统的全图推断降维并重构为面向特定目标的因果特征识别与评分任务。CausalRank 采用基于混合函数因果模型（FCM）的预训练范式，在全合成数据与半合成真实金融数据上进行预训练。每个环境都具有已知的直接因果结构和干预效应，因此模型可以同时学习某个因子是否直接影响未来收益，以及其因果作用有多强。训练数据进一步加入高相关 proxy、共同驱动变量和其他困难负样本，使模型能够在强预测相关性存在时识别直接因果因素。 在推理阶段，给定股票特征面板、历史收益，CausalRank 建模每个候选因子与目标收益之间的条件关系，并最终输出所有候选因子的连续因果排序得分。最终得分反映了直接因果存在性和因果作用强度，可直接用于因子筛选、因子加权和资产配置。 
+本文的主要贡献如下： 
+1. 我们提出面向单个子节点的因果因子排序任务，将直接因果识别与因果作用强度排序统一到同一个目标中。 
+2. 我们提出 CausalRank，一个用于因果因子排序的基础模型。模型通过大规模 synthetic FCM pretraining 学习可迁移的 target-specific causal inference，并直接应用于未见过的数据。 
+3.我们将金融因子筛选重构为目标导向的因果排序问题，在量化金融场景下尝试实现基于受控直接效应强度的连续因果排名。
+3. 我们提出联合建模直接因果存在性与因果作用强度的排序机制。模型同时判断候选因子是否为目标收益的直接原因，并估计其相对因果强度，从而将离散的父节点识别扩展为连续的因果排序。
+*
