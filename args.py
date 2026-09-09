@@ -33,8 +33,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--positive-class-weight",
         type=float,
-        default=0.0,
-        help="BCE 正类权重；0 表示按每个 batch 的有效正负样本数自动平衡",
+        default=25.25,
+        help="固定 BCE 正类权重；当前128-episode训练集的全局负正比约为25.25",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=5,
+        help="学习率从 base_lr/warmup 线性升至 base_lr 的 epoch 数；0 表示关闭",
+    )
+    parser.add_argument(
+        "--min-learning-rate-ratio",
+        type=float,
+        default=0.1,
+        help="cosine 末端学习率相对 --learning-rate 的比例",
     )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -96,4 +108,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cross-section-chunk-size 不能为负数")
     if args.positive_class_weight < 0.0:
         parser.error("--positive-class-weight 不能为负数")
+    if args.warmup_epochs < 0 or args.warmup_epochs >= args.epochs:
+        parser.error("--warmup-epochs 必须满足 0 <= warmup < epochs")
+    if not 0.0 <= args.min_learning_rate_ratio <= 1.0:
+        parser.error("--min-learning-rate-ratio 必须满足 0 <= ratio <= 1")
     return args

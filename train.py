@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 from argparse import Namespace
 from dataclasses import asdict, dataclass
@@ -469,6 +470,33 @@ def resolve_devices(value: str) -> Tuple[torch.device, Tuple[int, ...]]:
     return torch.device(f"cuda:{device_ids[0]}"), tuple(device_ids)
 
 
+def build_learning_rate_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_epochs: int,
+    warmup_epochs: int,
+    minimum_ratio: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """前 warmup 线性升温，随后按 epoch 做 cosine 衰减。"""
+
+    def multiplier(epoch_index: int) -> float:
+        # LambdaLR 在第一次训练前使用 index=0，因此 epoch 1 从较小学习率开始。
+        if warmup_epochs > 0 and epoch_index < warmup_epochs:
+            return float(epoch_index + 1) / float(warmup_epochs)
+        if total_epochs <= 1:
+            return 1.0
+        if warmup_epochs == 0:
+            progress = epoch_index / float(total_epochs - 1)
+        else:
+            progress = (epoch_index - warmup_epochs + 1) / float(
+                total_epochs - warmup_epochs
+            )
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return minimum_ratio + (1.0 - minimum_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=multiplier)
+
+
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
@@ -507,14 +535,38 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
+    scheduler = build_learning_rate_scheduler(
+        optimizer,
+        total_epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        minimum_ratio=args.min_learning_rate_ratio,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     start_epoch, global_step, best_metric = 1, 0, float("inf")
+    scheduler_restored = True
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         if checkpoint["model_config"] != asdict(config):
             raise ValueError("resume checkpoint 的模型配置与当前参数不一致。")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        if checkpoint.get("scheduler") is not None:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        else:
+            # v2 checkpoint 没有 scheduler；按已完成 epoch 推导下一轮学习率，
+            # 使旧模型仍可恢复，同时从此后的 v3 checkpoint 精确保存调度状态。
+            completed_epochs = int(checkpoint["epoch"])
+            scheduler.last_epoch = completed_epochs
+            next_lrs = [
+                base_lr * lr_lambda(completed_epochs)
+                for base_lr, lr_lambda in zip(
+                    scheduler.base_lrs, scheduler.lr_lambdas
+                )
+            ]
+            for parameter_group, next_lr in zip(optimizer.param_groups, next_lrs):
+                parameter_group["lr"] = next_lr
+            scheduler._last_lr = next_lrs
+            scheduler_restored = False
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(checkpoint["global_step"])
@@ -543,11 +595,15 @@ def main() -> None:
         f"cross_section_devices={cross_section_device_ids or (str(device),)} "
         f"checkpoint={args.cross_section_checkpoint} "
         f"positive_class_weight="
-        f"{'auto' if args.positive_class_weight == 0.0 else args.positive_class_weight}",
+        f"{'batch-auto' if args.positive_class_weight == 0.0 else args.positive_class_weight} "
+        f"lr_schedule=warmup({args.warmup_epochs})+cosine "
+        f"min_lr={args.learning_rate * args.min_learning_rate_ratio:.3e} "
+        f"scheduler_state={'exact' if scheduler_restored else 'derived-from-epoch'}",
         flush=True,
     )
     try:
         for epoch in range(start_epoch, args.epochs + 1):
+            current_learning_rate = float(optimizer.param_groups[0]["lr"])
             train_metrics, steps = run_epoch(
                 model, train_loader, device, optimizer, scaler,
                 args.effect_weight, args.rank_weight,
@@ -571,19 +627,24 @@ def main() -> None:
             best_metric = min(best_metric, selection_metric)
             record = {
                 "epoch": epoch, "global_step": global_step,
+                "learning_rate": current_learning_rate,
                 "train": train_metrics, "validation": validation_metrics,
                 "selection_metric": selection_metric,
             }
             with history_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            # scheduler 在 epoch 结束后准备下一轮学习率；最终轮无需越界更新。
+            if epoch < args.epochs:
+                scheduler.step()
             # 周期性更新同一个 checkpoint；最终 epoch 始终再更新一次。
             should_report = epoch % args.log_every == 0 or epoch == args.epochs
             checkpoint_path = None
             if should_report:
                 checkpoint_payload = {
-                    "format_version": 2, "epoch": epoch, "global_step": global_step,
+                    "format_version": 3, "epoch": epoch, "global_step": global_step,
                     "best_metric": best_metric, "model_config": asdict(config),
                     "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
                     "scaler": scaler.state_dict(), "rng_state": rng_state(),
                     "loader_generator_state": train_loader.generator.get_state(),
                     "arguments": serializable_arguments(args),
@@ -593,6 +654,7 @@ def main() -> None:
             state.update({
                 "status": "running", "last_completed_epoch": epoch,
                 "global_step": global_step, "best_metric": best_metric,
+                "learning_rate": current_learning_rate,
             })
             if checkpoint_path is not None:
                 state["last_checkpoint"] = str(checkpoint_path)
@@ -600,6 +662,7 @@ def main() -> None:
             if should_report:
                 print(
                     f"epoch={epoch}/{args.epochs} "
+                    f"lr={current_learning_rate:.3e} "
                     f"loss={train_metrics['loss']:.6f} "
                     f"balanced_acc={train_metrics['existence_balanced_accuracy']:.6f} "
                     f"pairwise_acc={train_metrics['pairwise_accuracy']:.6f}",
