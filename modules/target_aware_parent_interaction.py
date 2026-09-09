@@ -6,6 +6,226 @@ import torch
 from torch import Tensor, nn
 
 
+class ConditionalIncrementalEvidenceEncoder(nn.Module):
+    """从原始面板计算逐因子的显式条件增量证据。
+
+    隐式 attention 能比较候选表示，但并不保证它会学出“控制其他 X 后，
+    当前 X_j 是否仍解释 Y”这一统计量。本模块因此对每个 episode 构造一个
+    掩码兼容的标准化设计矩阵，并计算两类互补证据：
+
+    1. 全变量岭回归系数 beta_j，表示其他候选同时进入模型时 X_j 的增量；
+    2. 从联合精度矩阵得到的偏相关，表示给定 X_{-j} 后 X_j 与 Y 的关系。
+
+    这些量只由模型本来就收到的 X、Y 和观测掩码计算，不读取 z 或 tau，
+    因而不是标签泄漏。后面的可训练投影只负责把六个低维统计量映射到与
+    parent-aware representation 相同的 E 维空间。
+    """
+
+    statistic_dim = 6
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        ridge: float = 1e-2,
+    ) -> None:
+        super().__init__()
+        if embedding_dim <= 0:
+            raise ValueError("embedding_dim 必须为正整数。")
+        if ridge <= 0.0:
+            raise ValueError("conditional ridge 必须为正数。")
+
+        self.embedding_dim = embedding_dim
+        self.ridge = float(ridge)
+        # 统计量的物理尺度不同；先逐候选归一化，再用小型 MLP 形成条件证据
+        # token。该投影是残差支路，不会替代上游学到的非线性面板表示。
+        self.projection = nn.Sequential(
+            nn.LayerNorm(self.statistic_dim),
+            nn.Linear(self.statistic_dim, embedding_dim),
+            nn.GELU(),
+            nn.Linear(embedding_dim, embedding_dim),
+        )
+
+    def compute_statistics(
+        self,
+        factors: Tensor,
+        target_returns: Tensor,
+        factor_mask: Tensor,
+        feature_mask: Optional[Tensor] = None,
+        target_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """返回 `[B,D,6]` 的边际、岭回归、偏相关和覆盖率统计。
+
+        缺失因子先在各自有效观测上中心化、标准化，再以零填充；由于零正好
+        表示标准化后的均值，这相当于掩码感知的均值插补。随后按覆盖率缩放
+        列范数，避免观测较少的候选仅因零值更多而被系统性压低。
+        """
+
+        if factors.ndim != 4:
+            raise ValueError("factors 必须是 [B,N,T,D]。")
+        if target_returns.ndim != 3:
+            raise ValueError("target_returns 必须是 [B,N,T]。")
+        batch_size, num_assets, num_times, num_factors = factors.shape
+        if target_returns.shape != (batch_size, num_assets, num_times):
+            raise ValueError("target_returns 的 [B,N,T] 必须与 factors 对齐。")
+        if factor_mask.shape != (batch_size, num_factors):
+            raise ValueError("factor_mask 必须是 [B,D]。")
+        if factor_mask.dtype != torch.bool:
+            raise TypeError("factor_mask 必须是布尔张量。")
+        if factors.device != target_returns.device or factors.device != factor_mask.device:
+            raise ValueError("条件证据的 factors、target_returns 和 mask 必须同设备。")
+        if not torch.is_floating_point(factors) or not torch.is_floating_point(target_returns):
+            raise TypeError("条件证据的 X 和 Y 必须为浮点张量。")
+        if not torch.isfinite(factors).all() or not torch.isfinite(target_returns).all():
+            raise ValueError("条件证据的 X 和 Y 不能包含 NaN 或 Inf。")
+
+        expected_feature_shape = (batch_size, num_assets, num_times, num_factors)
+        if feature_mask is None:
+            feature_mask = torch.ones(
+                expected_feature_shape,
+                dtype=torch.bool,
+                device=factors.device,
+            )
+        elif feature_mask.shape != expected_feature_shape or feature_mask.dtype != torch.bool:
+            raise ValueError("feature_mask 必须是与 factors 同形状的布尔张量。")
+        expected_target_shape = (batch_size, num_assets, num_times)
+        if target_mask is None:
+            target_mask = torch.ones(
+                expected_target_shape,
+                dtype=torch.bool,
+                device=factors.device,
+            )
+        elif target_mask.shape != expected_target_shape or target_mask.dtype != torch.bool:
+            raise ValueError("target_mask 必须是与 target_returns 同形状的布尔张量。")
+        if feature_mask.device != factors.device or target_mask.device != factors.device:
+            raise ValueError("feature_mask、target_mask 和 factors 必须同设备。")
+
+        # 线性代数求解在 float16 下既不稳定也不被所有设备支持。显式关闭外层
+        # AMP 并使用 float32；投影输出稍后再转换回主干表示 dtype。
+        with torch.autocast(device_type=factors.device.type, enabled=False):
+            x = factors.float().reshape(batch_size, num_assets * num_times, num_factors)
+            y = target_returns.float().reshape(batch_size, num_assets * num_times)
+            observed_x = feature_mask.reshape(
+                batch_size, num_assets * num_times, num_factors
+            )
+            observed_y = target_mask.reshape(batch_size, num_assets * num_times)
+            joint_observed = observed_x & observed_y.unsqueeze(-1)
+
+            # 每列只使用 X_j 与 Y 同时有效的位置估计均值和方差。
+            x_count = joint_observed.sum(dim=1).float()
+            safe_x_count = x_count.clamp_min(1.0)
+            x_mean = (x * joint_observed).sum(dim=1) / safe_x_count
+            x_centered = (x - x_mean.unsqueeze(1)) * joint_observed
+            x_variance = x_centered.square().sum(dim=1) / safe_x_count
+            x_standardized = x_centered / torch.sqrt(
+                x_variance.clamp_min(1e-6)
+            ).unsqueeze(1)
+
+            y_count = observed_y.sum(dim=1).float()
+            safe_y_count = y_count.clamp_min(1.0)
+            y_mean = (y * observed_y).sum(dim=1) / safe_y_count
+            y_centered = (y - y_mean.unsqueeze(1)) * observed_y
+            y_variance = y_centered.square().sum(dim=1) / safe_y_count
+            y_standardized = y_centered / torch.sqrt(
+                y_variance.clamp_min(1e-6)
+            ).unsqueeze(1)
+
+            # 均值插补会使缺失较多的列范数减小；除以 sqrt(coverage) 后，每个
+            # 可用候选在完整目标样本尺度上的二阶矩仍约为 1。
+            coverage = x_count / safe_y_count.unsqueeze(-1)
+            x_design = x_standardized / torch.sqrt(
+                coverage.clamp_min(1e-6)
+            ).unsqueeze(1)
+            usable = (
+                factor_mask
+                & (x_count >= 2.0)
+                & (y_count >= 2.0).unsqueeze(-1)
+                & (x_variance >= 1e-6)
+                & (y_variance >= 1e-6).unsqueeze(-1)
+            )
+            x_design = x_design * usable.unsqueeze(1)
+
+            denominator = safe_y_count.reshape(batch_size, 1, 1)
+            gram = torch.bmm(x_design.transpose(1, 2), x_design) / denominator
+            cross = torch.bmm(
+                x_design.transpose(1, 2), y_standardized.unsqueeze(-1)
+            ).squeeze(-1) / safe_y_count.unsqueeze(-1)
+
+            # 岭回归同时放入所有候选。代理变量即便与 Y 高度相关，只要其信息
+            # 已被真正父节点解释，对应 beta 就应接近 0。
+            identity = torch.eye(
+                num_factors, dtype=torch.float32, device=factors.device
+            ).expand(batch_size, -1, -1)
+            ridge_gram = gram + self.ridge * identity
+            beta = torch.linalg.solve(ridge_gram, cross.unsqueeze(-1)).squeeze(-1)
+
+            # 将 Y 拼到标准化设计矩阵末列，联合协方差的逆即精度矩阵。
+            # precision[j,Y] 经对角缩放后得到控制其他全部 X 的偏相关。
+            joint_design = torch.cat(
+                (x_design, y_standardized.unsqueeze(-1)), dim=-1
+            )
+            joint_covariance = (
+                torch.bmm(joint_design.transpose(1, 2), joint_design)
+                / denominator
+            )
+            joint_identity = torch.eye(
+                num_factors + 1,
+                dtype=torch.float32,
+                device=factors.device,
+            ).expand(batch_size, -1, -1)
+            cholesky = torch.linalg.cholesky(
+                joint_covariance + self.ridge * joint_identity
+            )
+            precision = torch.cholesky_inverse(cholesky)
+            precision_xy = precision[:, :num_factors, -1]
+            precision_xx = precision[:, :num_factors, :num_factors].diagonal(
+                dim1=-2, dim2=-1
+            )
+            precision_yy = precision[:, -1, -1].unsqueeze(-1)
+            partial_correlation = -precision_xy / torch.sqrt(
+                (precision_xx * precision_yy).clamp_min(1e-12)
+            )
+
+            # 六个通道分别保留符号、强度与数据可靠性；abs 通道对应当前
+            # tau_direct 的非负强度语义，signed 通道仍可区分正负作用机制。
+            statistics = torch.stack(
+                (
+                    cross,
+                    beta,
+                    beta.abs(),
+                    partial_correlation,
+                    partial_correlation.abs(),
+                    coverage.clamp(0.0, 1.0),
+                ),
+                dim=-1,
+            )
+            statistics = statistics.masked_fill(~usable.unsqueeze(-1), 0.0)
+        return statistics
+
+    def forward(
+        self,
+        factors: Tensor,
+        target_returns: Tensor,
+        factor_mask: Tensor,
+        feature_mask: Optional[Tensor] = None,
+        target_mask: Optional[Tensor] = None,
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """返回投影后的 `[B,D,E]` 证据及可审计的原始 `[B,D,6]` 统计。"""
+
+        statistics = self.compute_statistics(
+            factors,
+            target_returns,
+            factor_mask,
+            feature_mask,
+            target_mask,
+        )
+        evidence = self.projection(statistics)
+        if output_dtype is not None:
+            evidence = evidence.to(dtype=output_dtype)
+        evidence = evidence.masked_fill(~factor_mask.unsqueeze(-1), 0.0)
+        return evidence, statistics
+
+
 class TargetAwareParentInteraction(nn.Module):
     """
     CausalRank 的目标感知父节点交互模块。
@@ -14,6 +234,10 @@ class TargetAwareParentInteraction(nn.Module):
         factor_features: [B, D, E] 或 [D, E]
         target_feature:  [B, E]    或 [E]
         factor_mask:     [B, D]    或 [D]，True 表示该 episode 中因子可观测
+        factors:         [B,N,T,D] 或 [N,T,D]，用于计算条件增量证据
+        target_returns:  [B,N,T]   或 [N,T]
+        feature_mask:    与 factors 同形状的观测掩码
+        target_mask:     与 target_returns 同形状的观测掩码
 
     输出：
         parent_features: [B, D, E] 或 [D, E]
@@ -25,6 +249,8 @@ class TargetAwareParentInteraction(nn.Module):
         Target Relation Extraction
         ↓
         R^Y = (r_1^Y, ..., r_D^Y)
+        ↓
+        Explicit Conditional Incremental Evidence
         ↓
         Target-Conditioned Leave-One-Out Competition
         ↓
@@ -47,8 +273,9 @@ class TargetAwareParentInteraction(nn.Module):
             表示经过候选变量竞争后得到的 parent-aware representation
 
     注意：
-        本模块并不执行形式化的条件独立检验。
-        它通过合成因果监督学习区分直接父节点和高度相关非父节点。
+        岭回归和偏相关是可微、正则化的条件证据近似，并不是对一般非线性
+        SCM 的形式化条件独立检验。它们作为残差通道补充神经表示，最终的
+        父节点判断仍由合成因果监督学习。
     """
 
     def __init__(
@@ -57,6 +284,7 @@ class TargetAwareParentInteraction(nn.Module):
         num_heads: int = 8,
         hidden_dim: int = 256,
         dropout: float = 0.0,
+        conditional_ridge: float = 1e-2,
     ) -> None:
 
         super().__init__()
@@ -80,9 +308,13 @@ class TargetAwareParentInteraction(nn.Module):
                 "dropout 必须满足 0 <= dropout < 1。"
             )
 
+        if conditional_ridge <= 0.0:
+            raise ValueError("conditional_ridge 必须为正数。")
+
         self.embedding_dim = embedding_dim
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
+        self.conditional_ridge = float(conditional_ridge)
 
         # ============================================================
         # 1. Target Relation Extraction
@@ -142,7 +374,19 @@ class TargetAwareParentInteraction(nn.Module):
         )
 
         # ============================================================
-        # 2. Target Relevance Gate
+        # 2. Explicit Conditional Incremental Evidence
+        # ============================================================
+
+        # 直接从原始 X/Y 面板计算控制全部其他候选后的岭回归与偏相关证据。
+        # 它不使用标签，并通过残差连接补充而不是替代 target interaction。
+        self.conditional_evidence_encoder = ConditionalIncrementalEvidenceEncoder(
+            embedding_dim=embedding_dim,
+            ridge=conditional_ridge,
+        )
+        self.conditional_evidence_norm = nn.LayerNorm(embedding_dim)
+
+        # ============================================================
+        # 3. Target Relevance Gate
         # ============================================================
 
         # 对已经 target-conditioned 的候选表示估计
@@ -159,7 +403,7 @@ class TargetAwareParentInteraction(nn.Module):
         )
 
         # ============================================================
-        # 3. Target-Conditioned Conditional Competition
+        # 4. Target-Conditioned Conditional Competition
         # ============================================================
 
         # 与旧版本不同：
@@ -202,7 +446,7 @@ class TargetAwareParentInteraction(nn.Module):
         )
 
         # ============================================================
-        # 4. Parent Evidence Fusion
+        # 5. Parent Evidence Fusion
         # ============================================================
 
         # 比较：
@@ -211,15 +455,16 @@ class TargetAwareParentInteraction(nn.Module):
         # c_j
         # r_j^Y - c_j
         # r_j^Y * c_j
+        # q_j^{cond}，显式条件增量证据
         #
         # 学习当前候选因子相对于其他 target-related
         # 候选变量的父节点证据。
         self.parent_representation_network = nn.Sequential(
             nn.LayerNorm(
-                embedding_dim * 4
+                embedding_dim * 5
             ),
             nn.Linear(
-                embedding_dim * 4,
+                embedding_dim * 5,
                 hidden_dim,
             ),
             nn.GELU(),
@@ -366,6 +611,66 @@ class TargetAwareParentInteraction(nn.Module):
             factor_mask,
             remove_batch_dimension,
         )
+
+    def _validate_and_batch_panel_inputs(
+        self,
+        factors: Optional[Tensor],
+        target_returns: Optional[Tensor],
+        feature_mask: Optional[Tensor],
+        target_mask: Optional[Tensor],
+        batch_size: int,
+        num_factors: int,
+        remove_batch_dimension: bool,
+    ) -> Tuple[
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+        Optional[Tensor],
+    ]:
+        """校验显式条件证据所需的原始面板，并统一增加 batch 维。
+
+        为兼容仅把预编码 H/h_Y 交给本模块的旧用法，X 和 Y 可以同时省略；
+        但禁止只给其中一个，因为那会悄悄退化成含义不完整的条件统计。
+        """
+
+        if factors is None and target_returns is None:
+            if feature_mask is not None or target_mask is not None:
+                raise ValueError("未提供 factors/target_returns 时不能单独提供观测掩码。")
+            return None, None, None, None
+        if factors is None or target_returns is None:
+            raise ValueError("factors 和 target_returns 必须同时提供或同时省略。")
+
+        if remove_batch_dimension:
+            if factors.ndim != 3 or target_returns.ndim != 2:
+                raise ValueError(
+                    "无 batch 表示输入对应的 factors/target_returns 必须为 "
+                    "[N,T,D]/[N,T]。"
+                )
+            factors = factors.unsqueeze(0)
+            target_returns = target_returns.unsqueeze(0)
+            if feature_mask is not None:
+                if feature_mask.ndim != 3:
+                    raise ValueError("无 batch feature_mask 必须为 [N,T,D]。")
+                feature_mask = feature_mask.unsqueeze(0)
+            if target_mask is not None:
+                if target_mask.ndim != 2:
+                    raise ValueError("无 batch target_mask 必须为 [N,T]。")
+                target_mask = target_mask.unsqueeze(0)
+        elif factors.ndim != 4 or target_returns.ndim != 3:
+            raise ValueError(
+                "带 batch 表示输入对应的 factors/target_returns 必须为 "
+                "[B,N,T,D]/[B,N,T]。"
+            )
+
+        if factors.shape[0] != batch_size or factors.shape[-1] != num_factors:
+            raise ValueError("原始 factors 的 B、D 必须与 factor_features 对齐。")
+        if target_returns.shape != factors.shape[:-1]:
+            raise ValueError("target_returns 必须与 factors 的 [B,N,T] 对齐。")
+        if feature_mask is not None and feature_mask.shape != factors.shape:
+            raise ValueError("feature_mask 必须与 factors 形状相同。")
+        if target_mask is not None and target_mask.shape != target_returns.shape:
+            raise ValueError("target_mask 必须与 target_returns 形状相同。")
+        return factors, target_returns, feature_mask, target_mask
 
     # ================================================================
     # Step 1
@@ -625,6 +930,7 @@ class TargetAwareParentInteraction(nn.Module):
         self,
         factor_target_features: Tensor,
         conditional_features: Tensor,
+        conditional_evidence: Optional[Tensor] = None,
     ) -> Tensor:
         """
         比较候选因子的目标证据和其他变量形成的竞争上下文。
@@ -643,9 +949,17 @@ class TargetAwareParentInteraction(nn.Module):
             c_j
             r_j^Y - c_j
             r_j^Y * c_j
+            q_j^{cond}
 
         学习 parent-aware representation。
         """
+
+        if conditional_evidence is None:
+            # 保留旧的独立模块调用方式；没有原始面板时显式证据取零，而不是
+            # 伪造某种条件关系。完整 CausalRankModel 始终会提供真实 X/Y。
+            conditional_evidence = torch.zeros_like(factor_target_features)
+        if conditional_evidence.shape != factor_target_features.shape:
+            raise ValueError("conditional_evidence 必须与 factor_target_features 同形。")
 
         competition_residual = (
             factor_target_features
@@ -663,6 +977,7 @@ class TargetAwareParentInteraction(nn.Module):
                 conditional_features,
                 competition_residual,
                 competition_agreement,
+                conditional_evidence,
             ),
             dim=-1,
         )
@@ -693,6 +1008,10 @@ class TargetAwareParentInteraction(nn.Module):
         factor_features: Tensor,
         target_feature: Tensor,
         factor_mask: Optional[Tensor] = None,
+        factors: Optional[Tensor] = None,
+        target_returns: Optional[Tensor] = None,
+        feature_mask: Optional[Tensor] = None,
+        target_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         完整计算：
@@ -706,6 +1025,10 @@ class TargetAwareParentInteraction(nn.Module):
             ↓
 
             R^Y
+
+            ↓
+
+            Explicit Ridge / Partial-Correlation Evidence
 
             ↓
 
@@ -741,6 +1064,21 @@ class TargetAwareParentInteraction(nn.Module):
             target_feature,
             factor_mask,
         )
+        batch_size, num_factors, _ = factor_features.shape
+        (
+            factors,
+            target_returns,
+            feature_mask,
+            target_mask,
+        ) = self._validate_and_batch_panel_inputs(
+            factors,
+            target_returns,
+            feature_mask,
+            target_mask,
+            batch_size,
+            num_factors,
+            remove_batch_dimension,
+        )
 
         # Step 1
         factor_target_features = (
@@ -755,7 +1093,29 @@ class TargetAwareParentInteraction(nn.Module):
             0.0,
         )
 
-        # Step 2
+        # Step 2：由原始面板计算显式条件增量。如果调用者只提供已经编码好的
+        # H/h_Y，则该支路严格为零；完整训练模型会始终走有条件证据的路径。
+        conditional_evidence = torch.zeros_like(factor_target_features)
+        if factors is not None and target_returns is not None:
+            conditional_evidence, _ = self.conditional_evidence_encoder(
+                factors,
+                target_returns,
+                factor_mask,
+                feature_mask,
+                target_mask,
+                output_dtype=factor_target_features.dtype,
+            )
+            # 在进入候选竞争前先注入条件证据，使 attention 的 query/key/value
+            # 都能区分“边际相关但条件增量接近零”的代理变量。
+            factor_target_features = self.conditional_evidence_norm(
+                factor_target_features + conditional_evidence
+            )
+            factor_target_features = factor_target_features.masked_fill(
+                ~factor_mask.unsqueeze(-1),
+                0.0,
+            )
+
+        # Step 3
         #
         # 关键修改：
         #
@@ -773,10 +1133,11 @@ class TargetAwareParentInteraction(nn.Module):
             )
         )
 
-        # Step 3
+        # Step 4
         parent_features = self.fuse(
             factor_target_features,
             conditional_features,
+            conditional_evidence,
         )
         # 融合网络含偏置，需再次归零不可观测位置，供外部监督掩码安全使用。
         parent_features = parent_features.masked_fill(

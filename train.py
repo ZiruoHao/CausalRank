@@ -43,7 +43,9 @@ else:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    architecture_version: int = 2
+    # v3 在 Parent Interaction 中加入显式岭回归/偏相关条件增量证据。
+    # 版本递增使旧 checkpoint 明确失败，而不是静默遗漏新增参数。
+    architecture_version: int = 3
     market_state_dim: int = 0
     embedding_dim: int = 128
     num_heads: int = 8
@@ -55,6 +57,7 @@ class ModelConfig:
     temporal_layers: int = 2
     max_time_steps: int = 256
     parent_hidden_dim: int = 256
+    conditional_ridge: float = 1e-2
     decoder_hidden_dim: int = 256
     dropout: float = 0.1
 
@@ -83,6 +86,7 @@ class CausalRankModel(nn.Module):
             num_heads=config.num_heads,
             hidden_dim=config.parent_hidden_dim,
             dropout=config.dropout,
+            conditional_ridge=config.conditional_ridge,
         )
         self.decoder = CausalRankingDecoder(
             embedding_dim=config.embedding_dim,
@@ -115,6 +119,10 @@ class CausalRankModel(nn.Module):
             factor_features,
             target_feature,
             factor_mask=factor_observation_mask,
+            factors=batch["X"],
+            target_returns=batch["Y"],
+            feature_mask=batch["feature_mask"],
+            target_mask=batch["target_mask"],
         )
         outputs = self.decoder(parent_features, return_auxiliary=True)
         return outputs, supervision_mask
@@ -521,6 +529,7 @@ def main() -> None:
         temporal_layers=args.temporal_layers,
         max_time_steps=args.max_time_steps,
         parent_hidden_dim=args.parent_hidden_dim,
+        conditional_ridge=args.conditional_ridge,
         decoder_hidden_dim=args.decoder_hidden_dim,
         dropout=args.dropout,
     )

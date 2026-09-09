@@ -94,6 +94,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal-layers", type=int, default=2)
     parser.add_argument("--max-time-steps", type=int, default=256)
     parser.add_argument("--parent-hidden-dim", type=int, default=256)
+    parser.add_argument(
+        "--conditional-ridge",
+        type=float,
+        default=1e-2,
+        help="显式条件增量证据中岭回归与偏相关协方差的正则强度",
+    )
     parser.add_argument("--decoder-hidden-dim", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
 
@@ -108,6 +114,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cross-section-chunk-size 不能为负数")
     if args.positive_class_weight < 0.0:
         parser.error("--positive-class-weight 不能为负数")
+    if args.conditional_ridge <= 0.0:
+        parser.error("--conditional-ridge 必须为正数")
     if args.warmup_epochs < 0 or args.warmup_epochs >= args.epochs:
         parser.error("--warmup-epochs 必须满足 0 <= warmup < epochs")
     if not 0.0 <= args.min_learning_rate_ratio <= 1.0:
