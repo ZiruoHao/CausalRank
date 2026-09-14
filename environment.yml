@@ -7,6 +7,10 @@ dependencies:
   - python=3.11
   - pytorch=2.5.1
   - pytorch-cuda=12.1
+  # PyTorch's Conda binary requires the ITT symbols removed from MKL 2024.1+.
+  - mkl=2023.1
+  - intel-openmp=2023.1
+  - tbb=2021.8
   - pip
   - pip:
       - numpy==1.26.4

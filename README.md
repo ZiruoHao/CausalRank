@@ -15,6 +15,9 @@ python tests/test_ranking_metrics.py
 
 `pytorch-cuda=12.1` 需要新服务器安装兼容的 NVIDIA 驱动。若只使用 CPU，请从
 `environment.yml` 删除 `pytorch-cuda`，并根据目标平台安装 PyTorch CPU 构建。
+环境文件固定了与 PyTorch 2.5.1 兼容的 MKL/Intel OpenMP 版本；不要将 MKL
+单独升级到 2024.1 或更高版本，否则导入 PyTorch 时可能缺少
+`iJIT_NotifyEvent` 符号。
 
 ## 不进入 Git 的目录
 
