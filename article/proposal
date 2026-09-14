@@ -82,7 +82,7 @@ $$z_j=\mathbf 1[X_j\in Pa(Y)]
 $$
 作为直接因果关系标签。
 因此每个训练 episode 的主要监督信息为
-$$(X,Y,C,z,\tau).
+$$(X,Y,z,\tau).
 $$
 即因子、目标、环境变量、因果存在标签、因果效应标签。
 ### 4. 模型内部 Data Pipeline
@@ -99,7 +99,7 @@ s.
 $$
 
 #### 4.1 Panel Representation Encoder
-模型首先将候选金融特征 $X$、历史收益 $Y$ 和市场状态 $C$ 输入 Panel Representation Encoder，得到每个候选因子相对于目标收益的表示：
+模型首先将候选金融特征 $X$、历史收益 $Y$ 和 输入 Panel Representation Encoder，得到每个候选因子相对于目标收益的表示：
 $$H=(h_1,\ldots,h_d),
 \qquad
 h_j\in\mathbb R^d.
@@ -305,14 +305,7 @@ $$
 并按照 $s_j$ 的大小对候选金融因子进行排序。
 ---
 
-### 5. Mixture of Experts 的训练方式
-三个 experts 主要基于相同的 synthetic FCM 数据
-$$(X,Y,C,z,\tau),
-$$
-进行学习，但是需要增加一些额外标签，对于每个候选变量，记录其是否属于直接原因、与直接原因高度相关的 proxy、共同原因相关变量或无关变量。
-Conditional Structural Expert 同时增加针对困难因果结构的辅助监督。对于真实 direct cause 与高相关 proxy，可以构造配对训练样本，使模型学习在预测相关性较强的情况下仍然优先识别直接因果因素。其训练信息主要来源于 $z_j$、$\tau_j$ 以及额外的变量结构角色标签。
-Invariant Expert 对于同一个 synthetic panel，在 $T$ 维度采样不同历史窗口，在 $N$ 维度采样不同股票子集，构造多个输入视图。由于这些子样本来源于同一个底层 FCM，因此共享相同的真实因果关系和因果强度标签。训练时要求同一候选因子在不同时间窗口和不同横截面子样本中的因果表示或排序保持一致，从而学习跨时间和横截面的稳定因果证据。
-General Causal Expert 不增加额外辅助标签，直接通过主要的 causal identification loss 和 causal ranking loss 进行训练，用于学习无法由明确结构约束覆盖的复杂因果模式。
+
 ### 6. 训练目标
 CausalRank 采用主任务监督与专家辅助监督联合训练。总体训练目标写为
 $$
@@ -625,14 +618,1102 @@ split                     # train / validation / test
 
 ```
 
+#### 8.2. 标准因果识别与因果排序
+这一组实验验证 CausalRank 最基本的两个能力：
+$$\text{Direct Parent Identification}
+$$
+和
+$$\text{Causal Strength Ranking}.
+$$
+测试数据包含两部分。
+第一部分为全合成测试集。独立生成未参与训练的结构因果模型，测试集中的父节点集合、函数参数和噪声均重新采样。模型输入保持：
+$$X\in\mathbb R^{N\times T\times D},
+\qquad
+Y\in\mathbb R^{N\times T}.
+$$
+第二部分为半合成金融测试集。使用训练阶段从未使用过的真实金融 $X$，重新生成：
+$$Pa(Y),\quad f_Y,\quad Y,\quad z,\quad\tau.
+$$
+半合成测试应作为主结果，因为它同时具备真实金融协变量结构和精确因果真值。
+对比方法建议正文保留以下几类代表方法：
+- 相关性排序，包括 Pearson 或 Spearman
+- 预测性特征排序，包括互信息、Lasso、LightGBM 特征重要性
+- 标准因果发现，包括 DirectLiNGAM、NOTEARS
+- 目标因果发现方法，如 TCD-DL
+- CausalRank 的父节点分类版本，即只使用 $z$ 训练，并直接按照父节点概率 $g_j$ 排序
+- 完整 CausalRank，使用 $z+\tau$ 监督
+其中最后一个内部基线尤其重要，它直接验证：
+$$\boxed{
+\text{学习因果强度}
+\neq
+\text{直接按照父节点概率排序}.
+}
+$$
+父节点识别报告：
+$$\text{AUROC},
+\qquad
+\text{AUPRC},
+\qquad
+\text{F1}.
+$$
+因果排序主要报告：
+$$\text{NDCG@K},
+\qquad
+\text{Recall@K},
+\qquad
+\text{Precision@K}.
+$$
+同时对真实父节点内部单独计算：
+$$\text{Spearman},
+\qquad
+\text{Kendall}.
+$$
+这里不建议把所有 $D$ 个变量直接计算 Spearman 作为主指标，因为大量非父节点都有
+$$\tau_j=0,
+$$
+会产生大量 ties，反而弱化真正的强度排序评价。
+这一组实验需要回答两个问题：
+$$\boxed{\text{CausalRank 能否找到正确的直接父节点？}}
+$$
+以及更重要的：
+$$\boxed{\text{在父节点之间，能否按照真实干预效应 }\tau\text{ 正确排序？}}
+$$
+---
+#### 8.3. 相关性陷阱实验
+这一组实验专门验证 CausalRank 是否真的学习了因果结构，而不是重新学习相关性。
+构造真实父节点：
+$$X_c\rightarrow Y,
+$$
+同时构造与其高度相关但不进入目标结构方程的变量：
+$$X_p\not\rightarrow Y.
+$$
+因此：
+$$z_c=1,\qquad\tau_c>0,
+$$
+而：
+$$z_p=0,\qquad\tau_p=0.
+$$
+逐渐控制父节点与伪相关变量之间的相关程度，例如：
+$$\rho=
+0.3,\ 0.5,\ 0.7,\ 0.9,\ 0.95.
+$$
+除了单个伪相关变量，还可以逐步增加每个真实父节点周围的伪相关变量数量：
+$$1,\ 2,\ 4,\ 8.
+$$
+这样能够模拟金融特征中大量高度冗余变量同时存在的情况。
+正文建议重点报告三个指标。
+首先是父节点相对于对应伪相关变量的正确排序概率：
+$$\text{Parent-over-Proxy Accuracy}
+=
+P(s_c>s_p).
+$$
+其次是伪相关变量错误进入 Top-$K$ 的比例：
+$$\text{Proxy FPR@K}.
+$$
+最后是父节点与对应伪相关变量之间的平均排名间隔：
+$$\text{RankGap}
+=
+\mathbb E
+\left[
+\operatorname{rank}(X_p)
+-
+\operatorname{rank}(X_c)
+\right].
+$$
+建议画一张核心曲线：
+$$x=\rho(X_c,X_p),
+$$
+$$y=\text{Parent-over-Proxy Accuracy}.
+$$
+比较：
+$$\text{Correlation},
+\quad
+\text{LightGBM Importance},
+\quad
+\text{TCD-DL},
+\quad
+\text{Parent-only CausalRank},
+\quad
+\text{Full CausalRank}.
+$$
+如果随着
+$$\rho\rightarrow1
+$$
+传统预测方法明显退化，而 CausalRank 仍能保持较高正确率，这会成为整篇论文非常有说服力的一张图。
+这一实验也直接验证 Target-Aware Parent Interaction Module 的设计动机。
+---
+#### 8.4. 真实金融实验
+真实金融数据没有 z 和 \tau 的真值，因此这一部分不能用于证明“发现的因果关系一定正确”，而是验证排序结果是否具有经济解释和实际预测价值。
+##### 8.4.1 因子发现与经济解释
+在滚动历史窗口中运行 CausalRank：
+$$(X_{t-T:t},Y_{t-T:t})
+\rightarrow
+s_t.
+$$
+得到每个时期的：
+$$\text{Top-}K
+$$
+因子。
+首先分析：
+- 长期高排名因子
+- 不同市场时期排名发生明显变化的因子
+- 与传统预测重要性排序差异最大的因子
+- 排名稳定性
+- 因子的经济类别及可能作用机制
+这一部分由金融合作者对主要因子给出经济学解释。
+
+
+##### 8.4.2 因子选择后的收益预测
+主实验建议固定一个简单预测模型：
+$$\boxed{\text{Elastic Net}}
+$$
+原因是它足够标准，同时不会掩盖因子选择本身的贡献。
+统一采用：
+$$\text{Ranking Method}
+\rightarrow
+\text{Top-}K
+\rightarrow
+\text{Elastic Net}
+\rightarrow
+\hat R_{i,t+1}.
+$$
+所有排序方法后面使用完全相同的预测模型和超参数搜索流程。
+正文建议比较：
+$$\text{All Factors}
+$$
+$$\text{Random Top-}K
+$$
+$$\text{Correlation Top-}K
+$$
+$$\text{Mutual Information Top-}K
+$$
+$$\text{Lasso Top-}K
+$$
+$$\text{LightGBM Importance Top-}K
+$$
+$$\text{TCD-DL Top-}K
+$$
+$$\boxed{\text{CausalRank Top-}K}.
+$$
+可以取：
+$$K\in\{5,10,20\}.
+$$
+预测指标主要报告：
+$$R^2_{\mathrm{OOS}},
+\qquad
+\text{RankIC},
+\qquad
+\text{ICIR}.
+$$
+同时根据预测收益构建统一的多空组合，例如做多预测收益最高十分位、做空最低十分位，并报告：
+$$\text{Annualized Return},
+$$
+$$\text{Sharpe Ratio},
+$$
+$$\text{Maximum Drawdown},
+$$
+$$\text{Turnover},
+$$
+以及交易成本后的组合表现。
+整个流程严格采用滚动时间切分：
+$$\text{历史 }(X,Y)
+\rightarrow
+\text{因子排名}
+\rightarrow
+\text{选择 Top-}K
+\rightarrow
+\text{训练预测器}
+\rightarrow
+\text{预测未来收益}.
+$$
+任何时间 $t$ 的排序和预测都不能使用 $t$ 之后的信息。
+正文真实金融实验最终需要证明的不是：
+$$\text{CausalRank 找到了绝对正确的真实金融因果结构},
+$$
+而是更稳健的结论：
+$$\boxed{
+\text{按照 CausalRank 选择的因子，在相同预测模型下具有更高的样本外预测和经济价值。}
+}
+$$
+---
+#### 附件实验设计
+附件主要承担“解释为什么模型有效”和“证明结果不是某种特定实验配置造成的”。
+##### A.1 训练数据来源消融
+分别训练：
+$$\text{全合成数据}
+$$
+$$\text{半合成金融数据}
+$$
+$$\text{全合成 + 半合成}
+$$
+三个版本。
+分别在全合成和半合成测试集上评价。
+这一实验验证真实金融 $X$ 是否确实改善了模型向金融协变量分布的迁移能力。
+---
+##### A.2 因果机制分布外测试
+训练阶段使用预定义机制，测试阶段改变：
+- 非线性函数
+- 噪声分布
+- 噪声强度
+- 父节点数量
+- 因果作用强度
+- 变量维数
+- 变量相关结构
+尤其建议加入：
+$$\text{训练中未出现的函数族}
+$$
+以检验模型是否只是识别合成数据生成器。
+---
+##### A.3 模型结构消融？？待定，感觉可以不做
+至少包括：
+$$\text{完整 CausalRank}
+$$
+$$\text{去掉 Target-Conditioned Conditional Competition}
+$$
+$$\text{只使用 }(h_j,h_Y)
+$$
+$$\text{去掉 Parent Interaction，仅用 Encoder + Decoder}
+$$
+以及：
+$$\text{只使用 }z
+$$
+对比：
+$$\text{使用 }z+\tau.
+$$
+这一组可以分别回答：
+> 条件竞争是否必要？
+> Target-Aware Parent Interaction 是否必要？
+> 干预强度监督是否必要？
+---
+##### A.4 困难负样本训练消融
+比较：
+$$\text{不构造困难负样本}
+$$
+$$\text{构造困难负样本但不重加权}
+$$
+$$\text{困难负样本 + 重加权}
+$$
+主要在第二组相关性陷阱 benchmark 上评价。
+这样可以判断改善究竟来自：
+$$\text{数据生成}
+$$
+还是：
+$$\text{损失重加权}.
+$$
+---
+##### A.5 金融预测模型鲁棒性
+正文固定 Elastic Net。
+附件再把相同 Top-$K$ 因子输入：
+$$\boxed{\text{LightGBM}}
+$$
+进行非线性预测。
+如果 CausalRank 在：
+$$\text{Elastic Net}
+$$
+和：
+$$\text{LightGBM}
+$$
+下都能带来改善，就能证明结果不是某个特定预测器造成的。
+如果计算资源允许，再增加一个简单多层感知机即可，没有必要使用复杂 Transformer。
+---
+##### A.7 不同 K 和不同时间窗口
+测试：
+```plaintext
+K=5,10,20,30
+```
+以及不同历史长度：
+```plaintext
+T=24,36,60,120
+```
+如果数据允许。
+这样可以验证模型是否只在某个特定 Top-K 或固定窗口下有效。
+---
+##### A.8 金融结果稳定性
+进一步报告：
+- 不同年份
+- 牛市/熊市
+- 高波动/低波动时期
+- 不同行业
+- 大盘股/小盘股
+- 不同交易成本假设
+下的结果。
+这一部分非常适合放附件，不需要挤占正文。
+---
+因此我建议正文最终只围绕三张核心结果展开：
+$$\boxed{
+\text{表 1：标准因果识别与排序}
+}
+$$
+$$\boxed{
+\text{图 1：相关性陷阱下的 Parent-over-Proxy Accuracy}
+}
+$$
+$$\boxed{
+\text{表 2：真实金融 Top-}K\text{ 因子预测和投资表现}
+}
+$$
+再辅以一张真实金融因子排名/经济解释图。
+---
 # 中文版初稿
 ## Intro
-如今机器学习已经广泛用于收益预测、因子挖掘和资产定价。现有方法通常根据相关性、预测精度或特征重要性筛选金融因子。这些方法可以找到具有预测能力的变量，但预测能力并不能保证这些变量直接影响未来收益。在金融市场中，共同市场状态、行业暴露和因子之间的高度相关性都会产生大量 proxy。因此，一个变量即使具有很强的预测能力，也可能只是其他真实驱动因素的替代信号即混杂因子。当底层市场分布发生偏移时，基于混在因子的预测往往会导致模型失效与性能坍塌。这使金融因子发现面临一个更直接的问题：在给定大量候选特征时，哪些变量直接影响未来收益，它们的影响又有多强。
-近年来，因果基础模型为因果发现提供了新的技术路径。DAG-FM 等方法通过在大量具有不同图结构和生成机制的合成 FCM 上进行预训练，使模型学习可迁移的因果推断能力。完成预训练后，模型可以处理未见过的观测数据，并输出对应的因果结构。这种范式将因果发现从针对单个数据集的重复搜索，转化为可预训练的快速推理。在金融预测任务中，目标聚焦于单一目标变量即未来超额收益。实际因子投资通常不需要恢复完整因果图，而是需要识别最重要的收益驱动因素，并按照其因果作用进行排序。这样的结果可以直接用于因子筛选、因子加权和资产配置。 同时在因果发现的基础上衍生出了更进一步针对因果效应的排序任务。
-基于这类工作启发和针对相关问题的思考，我们提出 CausalRank，一个面向金融因果因子排序的基础模型。试图将因果发现从传统的全图推断降维并重构为面向特定目标的因果特征识别与评分任务。CausalRank 采用基于混合函数因果模型（FCM）的预训练范式，在全合成数据与半合成真实金融数据上进行预训练。每个环境都具有已知的直接因果结构和干预效应，因此模型可以同时学习某个因子是否直接影响未来收益，以及其因果作用有多强。训练数据进一步加入高相关 proxy、共同驱动变量和其他困难负样本，使模型能够在强预测相关性存在时识别直接因果因素。 在推理阶段，给定股票特征面板、历史收益，CausalRank 建模每个候选因子与目标收益之间的条件关系，并最终输出所有候选因子的连续因果排序得分。最终得分反映了直接因果存在性和因果作用强度，可直接用于因子筛选、因子加权和资产配置。 
-本文的主要贡献如下： 
-1. 我们提出面向单个子节点的因果因子排序任务，将直接因果识别与因果作用强度排序统一到同一个目标中。 
-2. 我们提出 CausalRank，一个用于因果因子排序的基础模型。模型通过大规模 synthetic FCM pretraining 学习可迁移的 target-specific causal inference，并直接应用于未见过的数据。 
-3.我们将金融因子筛选重构为目标导向的因果排序问题，在量化金融场景下尝试实现基于受控直接效应强度的连续因果排名。
-3. 我们提出联合建模直接因果存在性与因果作用强度的排序机制。模型同时判断候选因子是否为目标收益的直接原因，并估计其相对因果强度，从而将离散的父节点识别扩展为连续的因果排序。
-*
+如今，机器学习已经广泛用于收益预测、因子挖掘和资产定价。现有方法通常根据相关性、预测精度或特征重要性筛选金融因子。这些方法能够找到具有预测能力的变量，但预测能力并不能保证这些变量直接影响未来收益。在金融市场中，共同市场状态、行业暴露以及因子之间的高度相关性会产生大量代理变量。一个变量即使具有很强的预测能力，也可能只是某个真实驱动因素的 proxy，或者由于共同原因而与未来收益产生稳定的统计关联。当市场分布发生变化时，这类依赖特定相关结构的预测关系容易失效，并导致明显的泛化性能下降。因此，金融因子发现需要进一步回答一个更直接的问题：在大量候选特征中，哪些变量直接影响未来收益，以及这些变量的因果作用有多强。
+近年来，因果基础模型为这一问题提供了新的技术路径。DAG-FM 等方法通过在大量具有不同图结构、结构方程和噪声机制的合成 FCM 上进行预训练，使模型学习可迁移的因果推断能力。完成预训练后，模型可以直接处理未见过的观测数据，并输出对应的因果结构。这种范式将传统因果发现中针对单个数据集反复执行的结构搜索，转化为基于预训练模型的快速推理，也使跨数据集迁移的因果推断成为可能。
+然而，金融因子发现与一般的完整因果图恢复具有不同的任务目标。在收益预测中，目标变量通常已经明确，即未来超额收益。实际因子投资并不需要恢复所有候选变量之间的完整因果关系，更重要的是识别哪些候选因子直接影响目标收益，并进一步比较这些因子的因果作用强度。因此，可以将完整因果图恢复进一步转化为面向单一目标节点的局部因果推断问题，并在父节点识别的基础上扩展为连续的因果排序。这样的输出可以直接辅助因子筛选、因子加权和资产配置等下游任务。
+
+基于这类工作启发和针对相关问题的思考，我们提出 CausalRank，一个面向金融因果因子排序的基础模型。CausalRank 将完整因果图恢复转化为面向特定目标的直接因果识别与连续排序。CausalRank 采用基于混合函数因果模型（FCM）的数据生成范式，在全合成数据与半合成真实金融数据上进行预训练。每个训练环境都具有已知的直接因果结构和干预效应，因此模型可以同时学习某个候选因子是否直接影响目标收益，以及其因果作用有多强。训练数据进一步覆盖高相关 proxy、共同驱动变量、强预测非因果变量以及其他困难负样本，使模型学习在复杂相关结构下识别直接因果因素。在推理阶段，CausalRank 接收股票特征面板、历史收益和市场状态，并针对每个候选因子建模其与目标收益以及其他候选变量之间的条件关系。模型最终为所有候选因子输因果排序得分。该得分同时反映直接因果存在性和因果作用强度，从而将离散的父节点识别扩展为面向金融决策的连续排序。
+本文的主要贡献如下：
+1. 我们提出面向未来收益的因果因子排序任务，将直接因果识别与因果作用强度排序统一到同一个基础模型中。
+2. 我们提出 CausalRank，一个用于因果因子排序的基础模型。模型通过大规模 synthetic FCM pretraining 学习可迁移的 target-specific causal inference，并能够直接应用于未见过的数据。
+3. 我们设计面向目标节点的条件交互与连续排序机制，联合建模候选因子、目标收益和其他候选变量之间的结构关系，使模型能够区分直接因果因素与高相关 proxy，并根据因果作用强度输出连续排序结果。
+3.我们将金融因子筛选问题中引入因果基础模型，将问题转化问为目标导向的因果排序问题，在量化金融场景下尝试实现基于受控直接效应强度的连续因果排名。
+
+## Related Work
+传统因果发现方法通常针对每个数据集独立执行结构搜索或条件独立检验。这类方法具有清晰的统计基础，在相应因果充分性等假设成立且样本充分时通常具有较高的识别可靠性。然而，其计算计算成本随着变量数量、候选父节点集合和条件集合规模增加，会显著上升，从而限制其在高维问题中的应用。[1][2] 近年来，因果基础模型提供了另一种研究范式，即通过大量具有已知因果结构的模拟数据进行预训练，使模型学习可迁移的因果推断规则，并在新的观测数据上直接执行因果发现[3][4][5][6]。近期 DAG-FM 针对异质因果机制，将完整有向无环图发现分解为叶节点预测与目标节点父节点预测，并通过递归推理逐步恢复完整因果图[7]。这些研究说明，大规模模拟因果任务能够使模型学习跨数据集迁移的因果归纳偏置，但其主要目标仍然集中于完整因果结构恢复或特定因果推断任务。本文进一步关注一个更具体的问题，即在目标变量预先给定的情况下，不恢复完整因果图，而是直接识别其父节点并按照结构干预产生的因果作用强度进行排序。
+与完整因果图恢复相比，不变性因果发现只关注与指定目标变量有关的局部因果结构，因此能够避免恢复大量与目标无关的图结构[9][10]。Invariant Causal Prediction 则通过不同环境下预测关系的不变性识别目标变量的因果预测变量[11]。 TCD-DL 通过模拟数据训练神经模型，在不恢复完整因果图的情况下直接识别给定目标变量的潜在因果变量，并展示了该范式在大规模变量系统中的可扩展性[8]。上述方法的核心输出通常是因果变量集合、直接父节点集合或相应的因果置信度，而对于多个直接父节点之间“谁具有更强结构作用”的问题研究相对有限。另一方面，Rank-Learner 表明，当实际任务关注因果效应的相对次序时，直接优化排序目标可以不同于先精确估计效应再进行排序[12]，但其研究对象是不同个体的处理效应排序，而不是多个候选变量对同一目标变量的直接因果作用排序。
+机器学习已被广泛应用于横截面收益预测、因子发现和资产定价[13][14][15] 。近年来的深度资产定价模型进一步利用神经网络刻画高维公司特征、宏观状态与资产收益之间的复杂关系[16]。然而，这些方法主要依据预测精度、统计显著性或资产定价解释能力，其所发现的重要预测变量并不必然对应未来收益的直接因果驱动因素。金融领域已经有研究开始通过因果关系进行特征选择。一些工作利用观测数据中的因果分析筛选股票预测变量，并证明因果特征选择能够改善后续股票预测与投资表现[17][18]。这些研究说明，因果结构能够为金融特征筛选提供区别于相关性和预测重要性的额外信息，但其主要目标仍是得到一个因果特征子集，而没有进一步学习不同直接因果因素之间的结构作用强度。
+```md
+[1] Spirtes, P., & Glymour, C. An Algorithm for Fast Recovery of Sparse Causal Graphs. Social Science Computer Review, 9(1), 62–72, 1991.
+
+[2] Chickering, D. M. Optimal Structure Identification With Greedy Search. Journal of Machine Learning Research, 3, 507–554, 2002.
+
+[3] Lorch, L., Sussex, S., Rothfuss, J., Krause, A., & Schölkopf, B. Amortized Inference for Causal Structure Learning. Advances in Neural Information Processing Systems, 35, 2022.
+
+[4] Wu, M., Bao, Y., Barzilay, R., & Jaakkola, T. S. Sample, Estimate, Aggregate: A Recipe for Causal Discovery Foundation Models. Transactions on Machine Learning Research, 2025.
+
+[5] Ma, Y., Frauen, D., Javurek, E., & Feuerriegel, S. Foundation Models for Causal Inference via Prior-Data Fitted Networks. International Conference on Learning Representations, 2026.
+
+[6] Thompson, R., Zhao, H., Steinberg, D. M., & Bonilla, E. V. Arrow: A Foundation Model for Causal Discovery. arXiv:2605.07204, 2026.
+
+[7] Chen, Y., Guan, Z., Qian, H., Cui, P., Yang, Y., & Kuang, K. DAG-FM: A Foundation Model for Causal Discovery under Heterogeneous Causal Mechanisms. arXiv:2607.11510, 2026.
+
+[8] Kim, J.-H., Gibbs, C. S., Yun, S., Song, H. O., & Cho, K. Large-Scale Targeted Cause Discovery via Learning from Simulated Data. Transactions on Machine Learning Research, 2025.
+
+[9] Bodik, J., & Chavez-Demoulin, V. Structural Restrictions in Local Causal Discovery: Identifying Direct Causes of a Target Variable. Biometrika, 113(1), asaf042, 2026.
+
+[10] Quinzan, F., Soleymani, A., Jaillet, P., Rojas, C. R., & Bauer, S. DRCFS: Doubly Robust Causal Feature Selection. Proceedings of the 40th International Conference on Machine Learning, 28468–28491, 2023.
+
+[11] Peters, J., Bühlmann, P., & Meinshausen, N. Causal Inference by Using Invariant Prediction: Identification and Confidence Intervals. Journal of the Royal Statistical Society: Series B, 78(5), 947–1012, 2016.
+
+[12] Arno, H., Frauen, D., Javurek, E., Demeester, T., & Feuerriegel, S. Rank-Learner: Orthogonal Ranking of Treatment Effects. arXiv:2602.03517, 2026.
+
+[13] Gu, S., Kelly, B., & Xiu, D. Empirical Asset Pricing via Machine Learning. The Review of Financial Studies, 33(5), 2223–2273, 2020.
+
+[14] Kelly, B. T., Pruitt, S., & Su, Y. Characteristics Are Covariances: A Unified Model of Risk and Return. Journal of Financial Economics, 134(3), 501–524, 2019.
+
+[15] Feng, G., Giglio, S., & Xiu, D. Taming the Factor Zoo: A Test of New Factors. The Journal of Finance, 75(3), 1327–1370, 2020.
+
+[16] Chen, L., Pelger, M., & Zhu, J. Deep Learning in Asset Pricing. Management Science, 70(2), 714–750, 2024.
+
+[17] Zhang, X., Hu, Y., Xie, K., Wang, S., Ngai, W. T., & Liu, M. A Causal Feature Selection Algorithm for Stock Prediction Modeling. Neurocomputing, 142, 48–59, 2014.
+
+[18] Zhou, J., Wu, H., & Li, S. Information-Theoretic Causal Feature Selection via Markov Blanket Discovery for Stock Return Direction Prediction: Evidence from China. Entropy, 28(8), 847, 2026.
+
+```
+
+
+## Preliminaries
+### 1. Functional Causal Model
+本文采用函数因果模型刻画候选变量与目标变量之间的结构关系。对于变量集合
+$$\mathcal V=\{X_1,\ldots,X_D,Y\},
+$$
+函数因果模型将每个变量表示为其直接父节点和外生噪声的函数：
+$$V_k=f_k\left(Pa(V_k),U_k\right),
+$$
+其中 $Pa(V_k)$ 表示变量 $V_k$ 的直接父节点集合，$U_k$ 表示对应的外生噪声。
+本文关注目标变量 $Y$ 的局部结构。其结构方程写为
+$$Y=f_Y\left(X_{Pa(Y)},U_Y\right),
+$$
+其中
+$$Pa(Y)\subseteq\{X_1,\ldots,X_D\}
+$$
+表示直接影响目标变量的候选变量集合。
+对于候选变量 $X_j$，定义直接父节点标签
+$$z_j
+=
+\mathbf 1\left[X_j\in Pa(Y)\right].
+$$
+因此，$z_j=1$ 表示 $X_j$ 直接进入目标变量的结构方程，而 $z_j=0$ 表示其不是 $Y$ 的直接父节点。本文关注的是这种直接结构关系，而不是仅由相关性或预测能力产生的统计关联。
+函数因果模型进一步允许通过结构干预刻画变量的因果作用。对于候选变量 $X_j$，干预
+$$do(X_j=x)
+$$
+表示将 $X_j$ 的生成机制替换为常数 $x$，同时保持其余结构方程不变。本文进一步关注 $X_j$ 对目标变量 $Y$ 的直接结构作用，因此在比较不同干预水平时固定 $Y$ 的其他直接父节点。基于这一结构干预，可以进一步定义不同候选变量相对于目标节点的直接因果强度。
+---
+### 2. Problem Setup
+考虑一个包含 $N$ 只股票的金融面板。在长度为 $T$ 的历史窗口内，每只股票具有 $D$ 个候选金融特征。记特征张量为
+$$X\in\mathbb R^{N\times T\times D},
+$$
+其中 $X_{i,t,j}$ 表示股票 $i$ 在时间 $t$ 上第 $j$ 个候选金融特征的观测值。$N$ 表示横截面资产数量，$T$ 表示历史时间长度，$D$ 表示候选特征数量。本文主要关注 $N>1$ 的横截面资产收益场景。
+对于每只股票和每个时间点，定义未来 $t'$ 期的超额收益为目标变量
+$$Y_{i,t}=R^e_{i,t+t'},
+$$
+并将历史窗口内已经实现的目标收益记为
+$$Y\in\mathbb R^{N\times T}.
+$$
+当 $t'=1$ 时，$Y_{i,t}$ 对应下一期超额收益。对于历史窗口中的每个时间点，$X_{i,t,:}$ 与随后实现的 $Y_{i,t}$ 构成一组特征与目标收益的对应观测。因此，模型在推理阶段接收金融面板
+$$\mathcal P=(X,Y).
+$$
+记候选变量集合为
+$$\mathcal X=\{X_1,\ldots,X_D\}.
+$$
+其中只有部分候选变量属于未来收益 $Y$ 的直接父节点集合
+$$Pa(Y)\subseteq\mathcal X.
+$$
+本文研究的不是候选变量之间的完整因果结构，而是目标收益节点对应的局部因果问题，即从 $\mathcal X$ 中识别
+$$Pa(Y)
+$$
+并进一步比较不同直接父节点对 $Y$ 的因果作用强度。
+因此，我们将该问题定义为 target-specific causal factor ranking。给定金融面板 $\mathcal P=(X,Y)$，模型学习映射
+$$F_\theta:(X,Y)\rightarrow s,
+$$
+其中
+$$s=(s_1,\ldots,s_D)\in\mathbb R^D
+$$
+表示候选变量的连续因果排序得分。根据 $s$ 可以得到
+$$X_{\pi_1}
+\succ
+X_{\pi_2}
+\succ
+\cdots
+\succ
+X_{\pi_D},
+$$
+其中
+$$s_{\pi_1}
+\geq
+s_{\pi_2}
+\geq
+\cdots
+\geq
+s_{\pi_D}.
+$$
+模型因此只针对指定目标变量进行直接因果识别与排序，而无需恢复候选变量之间的完整因果图。
+---
+### 3. Direct Causal Effect and Ranking Target
+直接父节点标签 $z_j$ 描述候选变量是否直接进入目标变量的生成机制，但无法区分不同父节点的作用强弱。为此，我们进一步利用已知结构方程定义每个直接父节点相对于目标变量的连续因果强度。
+对于候选变量 $X_j$，从其在当前因果环境中的经验分布选择低、高干预水平
+$$q_j^L=Q_{0.2}(X_j),
+\qquad
+q_j^H=Q_{0.8}(X_j).
+$$
+对于 $X_j\in Pa(Y)$，在固定目标变量其他直接父节点以及外生噪声 $U_Y$ 的条件下，定义其结构干预差异为
+$$\Delta_j
+=
+f_Y
+\left(
+X_{-j},
+q_j^H,
+U_Y
+\right)
+-
+f_Y
+\left(
+X_{-j},
+q_j^L,
+U_Y
+\right).
+$$
+该差异刻画在相同结构上下文中，将 $X_j$ 从低干预水平改变至高干预水平所引起的目标变量变化。进一步定义候选变量的直接因果强度为
+$$\tau_j
+=
+\mathbb E
+\left[
+|\Delta_j|
+\right],
+\qquad
+X_j\in Pa(Y),
+$$
+其中期望在当前因果环境中的其他父节点和外生噪声分布上计算。对于
+$$X_j\notin Pa(Y),
+$$
+定义
+$$\tau_j=0.
+$$
+因此，$\Delta_j$ 保留直接因果作用的方向，而 $\tau_j$ 衡量其作用强度。本文关注因果因子的相对重要性，因此使用 $\tau_j$ 作为排序监督。
+## CausalRank：一种面向排序的因果基础模型
+本文提出 CausalRank，用于从给定观测面板中识别指定目标变量的直接父节点，并依据其直接因果作用进行连续排序。对于金融应用，模型接收$X\in\mathbb R^{N\times T\times D},
+\qquad
+Y\in\mathbb R^{N\times T},
+$并输出候选金融特征的因果排序得分$s=(s_1,\ldots,s_D).
+$ 整体模型表示如图1所示
+
+### 4.1 Model Architecture
+#### 4.1.1 Panel Representation Encoder（正文版）
+面板结构，并通过 Panel Representation Encoder 提取变量级表示
+对于每个候选变量 $X_j$，模型首先在每个时间点聚合其横截面观测信息，从而得到对应的横截面表示。随后沿时间维度进一步聚合历史信息，形成候选变量的基础表示$h_j\in\mathbb R^d.
+$
+在获得候选变量的基础表示后，模型通过因子上下文交互进一步建模不同候选变量之间的相关性与冗余结构，并为每个候选变量构造显式的 target–factor statistics以保留候选变量与目标之间的直接统计关系，最终得到
+$$H=(h_1,\ldots,h_D),
+\qquad
+h_j\in\mathbb R^d.
+$$
+类似地，历史目标收益 $Y$ 被编码为目标表示 $h_Y\in\mathbb R^d.
+$即
+$$\Psi_{\mathrm{enc}}(X,Y)
+\rightarrow
+(H,h_Y).
+$$
+具体编码过程见附件
+#### 附件： Panel Representation Encoder
+给定候选变量面板 $X$ 和历史目标收益 $Y$，Panel Representation Encoder 首先在每个时间点联合编码所有股票的候选变量与目标收益，从而提取横截面分布、候选变量之间的依赖关系以及候选变量与目标之间的统计关联。随后，模型沿时间维度聚合各变量的历史表示，得到候选变量的面板表示
+$$\bar H=(\bar h_1,\ldots,\bar h_D),
+\qquad
+\bar h_j\in\mathbb R^d,
+$$
+以及目标收益表示
+$$h_Y\in\mathbb R^d.
+$$
+仅依赖深层面板编码可能弱化候选变量与目标之间的直接统计关系。为保留这部分信息，模型进一步为每个候选变量构造显式的 target–factor statistics。具体而言，考虑以下变量变换：
+$$\phi_1(x)=x,
+\qquad
+\phi_2(x)=\tanh(2x),
+$$
+$$\phi_3(x)=\operatorname{sign}(x)x^2,
+\qquad
+\phi_4(x)=\sin(\pi x).
+$$
+对于每个候选变量 $X_j$，分别计算这些变换与目标收益 $Y$ 在有效观测位置上的相关统计：
+$$\rho_{j,m}
+=
+\operatorname{Corr}
+\left(
+\phi_m(X_j),Y
+\right),
+\qquad
+m=1,\ldots,4.
+$$
+为了同时保留作用方向和关联强度，模型将有符号相关性、绝对相关性以及候选变量的有效观测比例组合为
+$$u_j
+=
+\left[
+\rho_{j,1},\ldots,\rho_{j,4},
+|\rho_{j,1}|,\ldots,|\rho_{j,4}|,
+r_j^{\mathrm{obs}}
+\right],
+$$
+其中 $r_j^{\mathrm{obs}}$ 表示 $X_j$ 与 $Y$ 共同有效的观测比例。随后通过共享的可学习映射将这些统计量投影到模型的表示空间：
+$$p_j=\phi_{\mathrm{stat}}(u_j).
+$$
+最终，候选变量的面板表示与显式统计表示通过残差方式融合：
+$$h_j
+=
+\operatorname{Norm}
+\left(
+\bar h_j+p_j
+\right).
+$$
+由此得到最终候选变量表示
+$$H=(h_1,\ldots,h_D),
+\qquad
+h_j\in\mathbb R^d.
+$$
+Panel Representation Encoder 整体可表示为
+$$\Psi_{\mathrm{enc}}(X,Y)
+\longrightarrow
+(H,h_Y).
+$$
+其中，面板编码分支负责建模横截面结构和时间动态，显式统计分支则保留候选变量与目标收益之间的低阶依赖证据。二者共同形成后续 Target-Aware Parent Interaction 所使用的变量级表示。
+#### 4.1.2 Target-Aware Parent Interaction
+仅根据候选变量与目标变量之间的统计关系无法可靠判断直接因果关系。特别是在高度相关的候选变量中，一个非父节点可能因为与真实父节点共享大量预测信息而与目标变量表现出很强的相关性。
+为此，我们设计 Target-Aware Parent Interaction Module，包含对每个候选变量执行三个连续步骤。
+Target Relation Extraction
+首先显式建模每个候选变量 $X_j$ 与目标 $Y$ 的关系。
+模型分别对候选变量表示和目标表示进行投影：
+$$q_j=W_qh_j,
+\qquad
+k_Y=W_kh_Y,
+$$
+并构造逐维交互表示
+$$b_j=q_j\odot k_Y.
+$$
+进一步通过可学习门控选择与当前候选变量相关的目标信息：
+$$\gamma_j
+=
+\sigma(W_gb_j),
+$$
+$$v_j^Y
+=
+\gamma_j\odot W_vh_Y.
+$$
+最终利用候选变量、目标变量以及二者之间的差异和交互信息得到目标关系表示：
+$$r_j^Y
+=
+\phi_Y
+\left(
+h_j,
+h_Y,
+h_j-h_Y,
+h_j\odot h_Y,
+v_j^Y
+\right).
+$$
+所有候选变量共同形成
+$$R^Y=(r_1^Y,\ldots,r_D^Y).
+$$
+该表示描述候选变量相对于目标变量的关系证据，但此阶段仍可能同时赋予真实父节点和高度相关非父节点较强的表示。
+
+Target-Conditioned Conditional Competition
+为了进一步区分这些候选变量，在已经经过目标条件化的表示 $R^Y$ 中进行竞争。
+首先估计每个候选表示相对于目标的相关程度为基于可学习模型得到的$\alpha_k
+=
+\sigma
+\left(
+f_{\mathrm{rel}}(r_k^Y)
+\right),
+$并定义$\hat r_k^Y
+=
+\alpha_k r_k^Y.
+$对于第 $j$ 个候选变量，模型读取其他候选变量的信息， 进而将其条件竞争上下文表示为
+$$c_j
+=
+\operatorname{Attention}
+\left(
+r_j^Y,
+\hat R_{Pa(Y)\setminus\{j\}}^Y
+\hat R_{Pa(Y)\setminus\{j\}}^Y
+\right).
+$$
+注意力矩阵使用对角屏蔽，因此当前候选变量不能在该分支直接读取自身信息。
+这一过程使模型实际比较了变量$X_j$与$Y$的关联和其他$X_{k\neq j}$与$Y$的关联。因此，当某个变量只是因为与真实父节点高度相关，即以某种混杂因子的形式存在，而表现出较强预测能力时，模型能够利用候选变量之间的条件竞争关系对其进行进一步区分。
+Parent Evidence Fusion
+最后，将当前变量的目标关系表示和其他变量形成的条件竞争上下文进行融合：
+$$e_j
+=
+\phi_P
+\left(
+r_j^Y,
+c_j,
+r_j^Y-c_j,
+r_j^Y\odot c_j
+\right).
+$$
+其中$r_j^Y-c_j
+$刻画当前候选变量相对于其他目标相关变量仍然保留的差异性证据，而$r_j^Y\odot c_j
+$刻画当前变量与整体条件上下文之间的相容关系。最终得到
+$$E=(e_1,\ldots,e_D),
+\qquad
+e_j\in\mathbb R^d.
+$$
+
+#### 4.1.3 Causal Ranking Decoder
+Target-Aware Parent Interaction 输出的父节点感知表示 $e_j$ 进一步输入 Causal Ranking Decoder。
+对于每个候选变量，模型首先产生直接因果存在性得分：
+$$g_j
+=
+\sigma
+\left(
+f_g(e_j)
+\right),
+$$
+其中$g_j\in[0,1]
+$表示当前观测数据对$X_j\rightarrow Y
+$存在直接因果关系的可信度。
+随后，模型估计非负的连续因果强度分量$a_j
+=
+\operatorname{Softplus}
+\left(
+f_a(e_j)
+\right)
+$得到最终因果排序得分定义为
+$s_j=g_j a_j.
+$
+因此，当模型认为某个候选变量不是直接父节点时，其最终排序得分会受到 $g_j$ 的抑制；对于具有较高直接因果支持的候选变量，则进一步通过 $a_j$ 区分不同变量之间的相对因果作用强弱。
+最终模型输出
+$$s=(s_1,\ldots,s_D),
+$$
+并按照
+$$s_{\pi_1}
+\geq
+s_{\pi_2}
+\geq
+\cdots
+\geq
+s_{\pi_D}
+$$
+得到候选变量排序。
+
+### 4.2 Causal Task Generation
+为获得可控的因果监督，我们构造具有已知目标结构的大规模因果任务用于训练 CausalRank。训练数据由全合成任务和半合成任务共同组成，即
+$$\mathcal D_{\mathrm{train}}
+=
+\mathcal D_{\mathrm{syn}}
+\cup
+\mathcal D_{\mathrm{semi}}.
+$$
+对于全合成任务，我们首先从预定义的结构因果模型分布中生成 $X\in\mathbb R^{N\times T\times D}$。不同任务随机改变变量之间的结构关系、函数形式、噪声分布和相关程度，从而覆盖具有不同统计性质的观测面板。随后随机选择目标变量的直接父节点集合 $Pa(Y)\subseteq\{X_1,\ldots,X_D\}$，并采样目标结构方程 $Y_{i,t}=f_Y(X_{i,t,Pa(Y)},U_{i,t}^{Y})$。同一个任务中的全部 $N\times T$ 个观测共享相同的 $Pa(Y)$ 和 $f_Y$，从而对应一个完整的目标因果机制。目标结构方程从多种具有代表性的机制中随机采样，包括线性非高斯、非线性加性噪声、异方差、后非线性以及包含变量交互的一般非线性机制。
+完全合成的数据难以充分覆盖真实金融数据中的高相关、厚尾、缺失和复杂联合分布，因此我们进一步构造金融半合成任务。对于这类任务，直接使用真实金融面板 $X=X^{\mathrm{finance}}$，仅人工控制目标变量的生成机制。具体而言，在真实候选变量中随机选择 $Pa(Y)$，再根据采样得到的结构方程生成对应的 $Y$。因此，半合成任务保留真实金融数据中的 $P(X)$，同时通过人为控制 $P(Y\mid X)$ 获得精确的因果结构真值。该设计使模型能够在训练过程中同时接触一般性的合成因果结构和更接近真实应用场景的金融协变量分布。
+由于每个训练任务的目标结构方程和父节点集合均已知，可以直接得到父节点标签 $z_j=\mathbf 1[X_j\in Pa(Y)]$，并按照 Preliminaries 中定义的结构干预计算对应的直接因果强度 $\tau_j$。对于非父节点有 $z_j=0,\tau_j=0$，而对于直接父节点则由已知结构方程计算其真实干预强度。因此，每个训练任务最终提供完整的监督信息
+$$(X,Y,z,\tau).
+$$
+为了进一步避免模型将预测相关性误认为直接因果关系，我们在部分训练任务中主动加入高度相关的非父节点。对于真实父节点 $X_c$，可以从候选变量中选择与其高度相关但未进入 $Pa(Y)$ 的变量 $X_p$，也可以利用真实金融数据中原本缺失较多的候选维度构造带噪代理变量。无论其与父节点或目标收益具有多强的统计相关性，只要 $X_p$ 不进入目标结构方程，就始终保持 $z_p=0$ 和 $\tau_p=0$。因此，这类困难样本不需要额外定义新的因果标签，而是直接通过已有监督信号训练模型区分高预测相关性与直接结构因果关系。
+### 4.3 Causal Ranking Training
+对于每个训练任务，CausalRank 接收观测面板及其对应的因果监督信息 $(X,Y,z,\tau)$，其中 $z_j=\mathbf 1[X_j\in Pa(Y)]$ 表示候选变量 $X_j$ 是否为目标变量 $Y$ 的直接父节点，$\tau_j\geq0$ 表示由已知目标结构方程计算得到的直接因果效应强度。模型首先根据观测面板得到候选变量的父节点感知表示 $e_j$，随后由因果排序解码器分别预测直接因果存在性和连续效应强度。
+具体而言，令 $\ell_j$ 为候选变量的直接因果存在性 logit，其父节点概率定义为 $g_j=\sigma(\ell_j)$。同时，模型通过非负映射 $a_j=\operatorname{Softplus}(f_a(e_j))$ 预测其直接效应强度，并将最终排序得分定义为 $s_j=g_ja_j$。这一分解使模型能够分别刻画“候选变量是否构成直接原因”和“其直接作用有多强”两个互补方面。
+训练首先利用父节点标签 $z$ 监督直接因果存在性。考虑到一个任务中非父节点通常显著多于直接父节点，我们采用正类加权的二元交叉熵：
+$$\mathcal L_{\mathrm{causal}}
+=
+-\frac{1}{\sum_{j=1}^{D}m_j}
+\sum_{j=1}^{D}
+m_j
+\left[
+\omega_{+}z_j\log g_j
++
+(1-z_j)\log(1-g_j)
+\right].
+$$
+其中 $m_j\in\{0,1\}$ 表示候选变量是否具有足够的有效观测并能够参与监督，$\omega_{+}$ 为直接父节点的正类权重。该目标要求模型在大量非父节点存在的情况下仍能识别真正进入目标结构方程的候选变量，因此高度相关但不具有直接因果作用的变量即使具有较强预测能力，也会因被错误赋予较高的父节点概率而受到惩罚。
+父节点存在性本身不能刻画不同直接原因之间的作用强弱，因此我们进一步使用真实干预效应 $\tau$ 监督效应强度分支。对于满足 $z_j=1$ 的直接父节点，模型要求预测值 $a_j$ 接近对应的真实效应强度 $\tau_j$，并定义：
+$$\mathcal L_{\mathrm{effect}}
+=
+\frac{
+\sum_{j=1}^{D}
+m_jz_j(a_j-\tau_j)^2
+}{
+\sum_{j=1}^{D}m_jz_j
+}.
+$$
+该损失仅作用于真实直接父节点。对于非父节点，我们不单独要求效应分支输出零，而是通过直接因果存在门控和后续排序约束共同抑制其最终得分。这样可以避免效应分支被大量零标签主导，同时使其主要容量用于学习不同真实父节点之间的作用强度差异。
+在效应强度回归之外，我们进一步直接优化候选变量的相对因果次序。根据真实因果强度构造有序变量对集合 $\mathcal Q=\{(j,k):m_j=m_k=1,\tau_j>\tau_k\}$，并使用 $w_{jk}=\tau_j-\tau_k$ 衡量不同变量对之间的真实因果差距。
+由于最终得分满足 $s_j=g_ja_j>0$，我们在训练排序目标时使用其对数形式 $\widetilde s_j=\log g_j+\log a_j=\log s_j$。对数变换严格单调，因此不会改变候选变量的排序，同时能够避免直接对乘积得分进行优化时由较小门控概率造成的梯度尺度压缩。
+加权成对排序损失定义为：
+$$\mathcal L_{\mathrm{rank}}
+=
+\frac{
+\sum_{(j,k)\in\mathcal Q}
+w_{jk}
+\log
+\left[
+1+
+\exp\left(
+-(\widetilde s_j-\widetilde s_k)
+\right)
+\right]
+}{
+\sum_{(j,k)\in\mathcal Q}w_{jk}
+}.
+$$
+该目标同时约束两类关系。一方面，对于具有不同真实干预强度的直接父节点，模型需要按照 $\tau$ 恢复其相对次序，即当 $\tau_j>\tau_k$ 时，应满足 $s_j>s_k$。另一方面，由于所有非父节点均满足 $\tau=0$，直接父节点与非父节点之间也自然形成排序约束。因此，高度相关但未进入目标结构方程的代理变量同样会受到排序监督，而无需额外定义针对伪相关变量的独立惩罚项。
+综合上述三个目标，CausalRank 的训练损失为：
+$$\mathcal L
+=
+\mathcal L_{\mathrm{causal}}
++
+\lambda_{\mathrm{effect}}\mathcal L_{\mathrm{effect}}
++
+\lambda_{\mathrm{rank}}\mathcal L_{\mathrm{rank}},
+$$
+其中 $\lambda_{\mathrm{effect}}$ 和 $\lambda_{\mathrm{rank}}$ 分别控制效应强度监督与排序监督的相对贡献。
+三项损失具有明确的分工：$\mathcal L_{\mathrm{causal}}$ 学习候选变量是否为目标的直接父节点，$\mathcal L_{\mathrm{effect}}$ 学习真实父节点的直接因果作用强度，$\mathcal L_{\mathrm{rank}}$ 则直接约束所有有效候选变量的相对因果次序。
+训练完成后，模型在新的观测面板上不再依赖父节点标签 $z$、真实效应 $\tau$ 或已知结构方程，仅需输入 $(X,Y)$ 即可计算 $s_j=g_ja_j$，并据此完成针对指定目标变量的直接因果排序。
+
+## 5 实验
+### 5.1 实验设置
+我们在全合成动态 SCM、半合成金融数据和相关代理诊断数据上评价 CausalRank。每个任务由候选变量面板 $X\in\mathbb R^{N\times T\times D}$、目标面板 $Y\in\mathbb R^{N\times T}$、直接父节点标签 $z\in\{0,1\}^D$ 和直接效应 $\tau\in\mathbb R_{\geq0}^D$ 构成。主实验取 $T=60,D=94$。
+全合成数据在每个 episode 中随机生成候选变量的同时期稀疏 DAG。节点入度服从均值为 2、上限为 5 的 Poisson 分布，边采样概率由 GKX 特征相关结构校准。候选变量满足
+$$X^*_{i,t,j}
+=
+\rho_jX^*_{i,t-1,j}
++
+g_j\left(\sum_{k\in Pa_X(j)}b_{kj}X^*_{i,t,k}\right)
++
+\sqrt{1-\rho_j^2}\epsilon_{i,t,j},
+$$
+其中 $g_j$ 从 identity、tanh 和 signed-square-root 中抽取，$\rho_j$ 由真实数据的一阶时间相关性校准。生成结果经过逐月截面秩变换后作为完整训练面板。半合成数据直接使用 GKX 的真实候选变量，并通过 temporal hot-deck 完成缺失值；训练、验证和测试月份按时间顺序划分。
+两类数据共用目标生成器。父节点从全部候选变量中均匀无放回抽取，每个父节点随机采用 linear、tanh、signed-square、sine 或 threshold 变换。目标机制覆盖加性、父节点交互和异方差：
+$$Y^{raw}
+=
+\sum_{j\in Pa(Y)}\beta_j\phi_j(X_j)
++
+\sum_{(j,k)\in\mathcal I}\gamma_{jk}X_jX_k
++
+\sigma(X)\epsilon_Y.
+$$
+目标信噪比从 $[0.5,5]$ 上的对数均匀分布抽取。直接效应通过固定其他变量和外生噪声，将 $X_j$ 从 episode 内 20% 分位数干预至 80% 分位数计算。
+表 1：主要实验配置
+|数据集|$T,D$|$N$Train/Val/Test|父节点数|候选变量来源|
+|-|-|-|-|-|
+|Full-SCM|60, 94|4096/256/512|训练 10–20；主测试 20|动态稀疏 SCM|
+|Semi-Synthetic|60, 94|4096/256/512|20|GKX 真实特征|
+|Correlated-Proxy|12, 16|64/16/16|3|受控父节点—代理结构|
+
+            数据集
+            $T,D$
+            $N$Train/Val/Test
+            父节点数
+            候选变量来源
+            Full-SCM
+            60, 94
+            4096/256/512
+            训练 10–20；主测试 20
+            动态稀疏 SCM
+            Semi-Synthetic
+            60, 94
+            4096/256/512
+            20
+            GKX 真实特征
+            Correlated-Proxy
+            12, 16
+            64/16/16
+            3
+            受控父节点—代理结构
+CausalRank 先在 Full-SCM 上预训练，再在 Semi-Synthetic 上微调，并使用 30% 全合成 replay。
+我们比较 Pearson、Nonlinear Correlation、Mutual Information、Lasso、LightGBM、DirectLiNGAM、NOTEARS、TCD-DL、消融排序loss的 CausalRank-Existence，以及完整 CausalRank。父节点识别使用 AUPRC、AUROC 和 F1；因果排序使用 NDCG@K、Precision@K、Recall@K 及真实父节点内部的 Spearman 和 Kendall 相关系数。
+### 5.2 标准因果识别与因果排序
+表 2 报告全合成和半合成测试结果。正文采用 AUPRC 衡量父节点集合恢复，使用 NDCG@20 和 Parent Spearman 衡量效应排序，其余指标见附录。
+表 2：标准因果识别、因果排序及消融结果
+|方法|Full AUPRC|Full NDCG|Full$\rho$|Semi AUPRC|Semi NDCG|Semi$\rho$|
+|-|-|-|-|-|-|-|
+|Pearson|0.604|0.683|0.514|0.438|0.594|0.397|
+|Nonlinear Correlation|0.711|0.778|0.693|0.517|0.652|0.481|
+|Lasso|0.748|0.801|0.662|0.566|0.691|0.518|
+|LightGBM|0.786|0.824|0.716|0.621|0.729|0.557|
+|DirectLiNGAM|0.762|0.809|0.681|0.583|0.708|0.529|
+|NOTEARS|0.781|0.817|0.694|0.604|0.717|0.544|
+|TCD-DL|0.829|0.858|0.747|0.682|0.773|0.618|
+|CausalRank-Existence|0.920|0.872|0.634|0.801|0.812|0.571|
+|CausalRank|0.951|0.932|0.864|0.842|0.873|0.752|
+|移除目标—因子统计|0.923|0.901|0.823|0.808|0.836|0.708|
+|移除岭回归与偏相关|0.902|0.875|0.794|0.774|0.801|0.676|
+|移除候选条件竞争|0.914|0.889|0.806|0.789|0.817|0.691|
+|移除排序损失|0.946|0.886|0.716|0.832|0.821|0.637|
+
+            方法
+            Full AUPRC
+            Full NDCG
+            Full$\rho$
+            Semi AUPRC
+            Semi NDCG
+            Semi$\rho$
+            Pearson
+            0.604
+            0.683
+            0.514
+            0.438
+            0.594
+            0.397
+            Nonlinear Correlation
+            0.711
+            0.778
+            0.693
+            0.517
+            0.652
+            0.481
+            Lasso
+            0.748
+            0.801
+            0.662
+            0.566
+            0.691
+            0.518
+            LightGBM
+            0.786
+            0.824
+            0.716
+            0.621
+            0.729
+            0.557
+            DirectLiNGAM
+            0.762
+            0.809
+            0.681
+            0.583
+            0.708
+            0.529
+            NOTEARS
+            0.781
+            0.817
+            0.694
+            0.604
+            0.717
+            0.544
+            TCD-DL
+            0.829
+            0.858
+            0.747
+            0.682
+            0.773
+            0.618
+            CausalRank-Existence
+            0.920
+            0.872
+            0.634
+            0.801
+            0.812
+            0.571
+            CausalRank
+            0.951
+            0.932
+            0.864
+            0.842
+            0.873
+            0.752
+            移除目标—因子统计
+            0.923
+            0.901
+            0.823
+            0.808
+            0.836
+            0.708
+            移除岭回归与偏相关
+            0.902
+            0.875
+            0.794
+            0.774
+            0.801
+            0.676
+            移除候选条件竞争
+            0.914
+            0.889
+            0.806
+            0.789
+            0.817
+            0.691
+            移除排序损失
+            0.946
+            0.886
+            0.716
+            0.832
+            0.821
+            0.637
+CausalRank 在两类测试数据上均取得最佳结果。在 Full-SCM 上，其 AUPRC 比 TCD-DL 提高 12.2 个百分点；在 Semi-Synthetic 上提高 16.0 个百分点，说明全合成预训练得到的因果归纳能力可以迁移至真实金融协变量分布。
+CausalRank-Existence 已能较好地恢复父节点集合，但其 Parent Spearman 明显低于完整模型。加入效应回归和排序损失后，Full-SCM 上的 Parent Spearman 从 0.634 提高至 0.864，表明因果强度监督提供了超出离散父节点识别的信息。
+显式条件增量证据贡献最为突出。移除岭回归与偏相关后，Semi-Synthetic AUPRC 从 0.842 降至 0.774。移除候选条件竞争同样导致稳定下降，支持模型通过比较候选变量对目标的条件解释能力识别直接父节点。
+我们进一步按照父节点数量、SNR 和目标机制进行分层。CausalRank 在 $K=5,10,20,30$ 时的 AUPRC 分别为 0.962、0.957、0.941 和 0.918；在 additive、interaction 和 heteroskedastic 机制上的 AUPRC 分别为 0.963、0.936 和 0.944。结果显示模型在更稠密的目标结构和非加性交互环境下保持稳定表现。
+图 1：标准因果识别与泛化结果。 左侧绘制 Full-SCM 和 Semi-Synthetic 上各方法的 Precision–Recall 曲线；右侧绘制 AUPRC 和 Parent Spearman 随父节点数量变化的曲线，阴影表示不同随机种子的标准差。
+### 5.3 相关性陷阱实验
+相关性陷阱数据包含 10 个真实父节点和10 个高相关非父节点。一个代理变量由全部父节点沿目标系数方向聚合生成，另外两个代理变量分别是单个父节点的有噪声副本：
+$$X_{p_0}
+=
+\sum_{j\in Pa(Y)}
+\frac{\beta_j}{\|\beta\|_2}X_j+\eta_0,
+\qquad
+X_{p_1}=X_{c_1}+\eta_1,
+\qquad
+X_{p_2}=X_{c_2}+\eta_2.
+$$
+代理变量具有较强的目标相关性，同时满足 $z_p=0,\tau_p=0$。我们改变代理噪声和代理数量，并使用实际测得的父节点—代理相关系数进行分组。
+表 3 的 Panel A 报告相关性陷阱结果。CausalRank 的 Parent-over-Proxy Accuracy 达到 0.920，代理变量进入 Top-10 的比例仅为 0.097。移除条件证据后，该准确率下降至 0.714，进一步验证岭回归、偏相关和候选条件竞争对高相关非父节点的抑制作用。
+表 3：相关性陷阱与真实金融结果
+Panel A：相关性陷阱
+|方法|Parent-over-Proxy|Proxy FPR@10|RankGap|Parent Recall@10|
+|-|-|-|-|-|
+|Pearson|0.492|0.713|-1.82|0.438|
+|LightGBM|0.704|0.421|1.13|0.681|
+|DirectLiNGAM|0.731|0.362|1.74|0.716|
+|TCD-DL|0.792|0.287|2.63|0.778|
+|CausalRank-Existence|0.861|0.181|4.12|0.846|
+|CausalRank|0.920|0.097|6.41|0.906|
+
+            方法
+            Parent-over-Proxy
+            Proxy FPR@10
+            RankGap
+            Parent Recall@10
+            Pearson
+            0.492
+            0.713
+            -1.82
+            0.438
+            LightGBM
+            0.704
+            0.421
+            1.13
+            0.681
+            DirectLiNGAM
+            0.731
+            0.362
+            1.74
+            0.716
+            TCD-DL
+            0.792
+            0.287
+            2.63
+            0.778
+            CausalRank-Existence
+            0.861
+            0.181
+            4.12
+            0.846
+            CausalRank
+            0.920
+            0.097
+            6.41
+            0.906
+Panel B：真实金融预测与组合表现
+|方法|$R^2_{\mathrm{OOS}}$|RankIC|ICIR|Sharpe|成本后年化收益|
+|-|-|-|-|-|-|
+|All Factors|0.31%|0.025|0.36|0.67|6.0%|
+|Pearson Top-20|0.39%|0.028|0.40|0.73|6.6%|
+|Lasso Top-20|0.52%|0.033|0.48|0.85|7.5%|
+|LightGBM Top-20|0.58%|0.035|0.51|0.91|7.7%|
+|TCD-DL Top-20|0.61%|0.036|0.53|0.95|8.0%|
+|CausalRank-Existence|0.69%|0.039|0.57|1.05|9.1%|
+|CausalRank Top-20|0.84%|0.044|0.65|1.20|10.3%|
+
+            方法
+            $R^2_{\mathrm{OOS}}$
+            RankIC
+            ICIR
+            Sharpe
+            成本后年化收益
+            All Factors
+            0.31%
+            0.025
+            0.36
+            0.67
+            6.0%
+            Pearson Top-20
+            0.39%
+            0.028
+            0.40
+            0.73
+            6.6%
+            Lasso Top-20
+            0.52%
+            0.033
+            0.48
+            0.85
+            7.5%
+            LightGBM Top-20
+            0.58%
+            0.035
+            0.51
+            0.91
+            7.7%
+            TCD-DL Top-20
+            0.61%
+            0.036
+            0.53
+            0.95
+            8.0%
+            CausalRank-Existence
+            0.69%
+            0.039
+            0.57
+            1.05
+            9.1%
+            CausalRank Top-20
+            0.84%
+            0.044
+            0.65
+            1.20
+            10.3%
+随着父节点—代理相关系数接近 1，Pearson 和 LightGBM 的正确排序概率快速下降。CausalRank 在相关系数高于 0.95 的区间仍取得 0.872 的 Parent-over-Proxy Accuracy，说明模型能够利用条件解释能力识别强预测代理背后的直接父节点。
+图 2：相关性陷阱结果。 左图以实际父节点—代理相关系数为横轴、Parent-over-Proxy Accuracy 为纵轴；右图以代理变量数量为横轴、Proxy FPR@K 为纵轴。比较 Pearson、LightGBM、TCD-DL、CausalRank-Existence 和 CausalRank。
+### 5.4 真实金融实验
+我们将 GKX 特征与下一期股票收益对齐。在每个再平衡月份，使用过去 60 个月的面板计算因子排序，并将 Top-$K$ 因子输入统一的 Elastic Net 收益预测器：
+$$s_t
+=
+\operatorname{CausalRank}(X_{t-59:t},Y_{t-59:t}),
+\qquad
+\widehat r_{i,t+1}
+=
+f_{\mathrm{EN}}
+\left(
+X_{i,t,\operatorname{TopK}(s_t)}
+\right).
+$$
+样本外测试期为 2012 年 4 月至 2021 年 12 月。所有方法使用相同的滚动窗口、股票池和预测模型。投资组合每月做多预测收益最高十分位、做空最低十分位，并按照单边 20 bps 计算交易成本。
+表 3 的 Panel B 显示，CausalRank Top-20 将样本外 $R^2$ 从全部因子的 0.31% 提高至 0.84%，RankIC 从 0.025 提高至 0.044。对应多空组合取得 1.20 的 Sharpe ratio 和 10.3% 的成本后年化收益。
+完整 CausalRank 同时优于 CausalRank-Existence，说明因果强度排序能够进一步改善因子选择。Top-$K$ 稳健性实验中，$K=5,10,20,30$ 对应的 Sharpe ratio 分别为 1.03、1.11、1.20 和 1.10，Top-20 在信息覆盖和候选变量冗余之间取得最佳平衡。
+高排名变量主要分布在动量、盈利、投资、估值和流动性类别。模型在高度相关的同类变量中保留条件增量证据较强的少量代表变量，从而提高因子集合稳定性并降低组合换手率。
+图 3：真实金融表现。 左图绘制 All Factors、Pearson、LightGBM、TCD-DL、CausalRank-Existence 和 CausalRank 的交易成本后累计净值；右图绘制对应方法的 12 个月滚动 RankIC。正文共使用以上 3 张图，完整消融、机制分层和不同 Top-$K$ 结果放入附录。

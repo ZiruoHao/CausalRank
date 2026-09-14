@@ -1,6 +1,6 @@
 """CausalRank 合成与半合成训练分片的 PyTorch Dataset。
 
-两个数据生成器共享同一份训练协议。v2 NPZ shard 包含 E 个 episode：
+两个数据生成器共享同一份训练协议。v2/v3/v4 NPZ shard 包含 E 个 episode：
 
     X:                 float32 [E,N,T,D]
     Y:                 float32 [E,N,T]
@@ -17,9 +17,11 @@ z 数组建立全局索引，实际访问 episode 时才解压对应 shard，并
 保留最近使用的少量分片。生产训练必须存在 manifest.json；生成中断后留下的
 临时目录会被明确拒绝，避免把不完整数据误用于训练。
 
-部分 episode 可能存在整个历史窗口都未观测到的因子。Dataset 保留原始字段
-协议；训练时可用 ``derive_factor_observation_mask(feature_mask)`` 得到 [D] 或
-[B,D] 的监督有效性掩码，并同时传给父节点交互模块与逐因子损失。
+部分 episode 可能存在整个历史窗口都未观测到的因子。Dataset 保留统一字段
+协议；v2 的 feature_mask 表示真实观测，v3 表示预处理后可供模型使用，
+v4 的 Full 数据则表示完整合成训练视图中的可用位置。
+训练时可用 ``derive_factor_observation_mask(feature_mask)`` 得到 [D] 或 [B,D]
+的监督有效性掩码，并同时传给父节点交互模块与逐因子损失。
 """
 
 from __future__ import annotations
@@ -56,7 +58,7 @@ TRAINING_ARRAY_NAMES_V1: Tuple[str, ...] = (
     "target_mask",
     "time_padding_mask",
 )
-# 当前两个生成器写出的 v2 协议。
+# v2/v3/v4 的数组协议相同；后续版本只扩展 feature_mask 和 Full 训练视图语义。
 TRAINING_ARRAY_NAMES: Tuple[str, ...] = (
     "X",
     "Y",
@@ -68,7 +70,7 @@ TRAINING_ARRAY_NAMES: Tuple[str, ...] = (
     "target_mask",
     "time_padding_mask",
 )
-SUPPORTED_FORMAT_VERSIONS = {1, 2}
+SUPPORTED_FORMAT_VERSIONS = {1, 2, 3, 4}
 # 每个字段在落盘时必须使用的精确 dtype。
 EXPECTED_DTYPES: Mapping[str, np.dtype] = {
     "X": np.dtype(np.float32),
@@ -88,7 +90,8 @@ def derive_factor_observation_mask(feature_mask: Tensor) -> Tensor:
 
     输入可为单 episode 的 ``[N,T,D]`` 或 batch 的 ``[B,N,T,D]``，输出分别
     为 ``[D]`` 或 ``[B,D]``。True 表示该因子在相应 episode 中至少有一个
-    真实观测，因此可以参与候选竞争和监督损失。
+    可用值（真实观测、v3 中的补充值或 v4 Full 中的完整合成值），因此可以
+    参与候选竞争和监督损失。
     """
 
     if feature_mask.ndim not in (3, 4):

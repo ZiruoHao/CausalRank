@@ -216,6 +216,107 @@ def compute_losses(
         "positive_count": positive_count.detach(),
         "true_negative": true_negative.detach(),
         "negative_count": negative_count.detach(),
+        # 以下六个量是 episode 级排序统计的可加总分子/分母。把它们和损失
+        # 一起返回，可确保 train、validation、test 经过完全相同的掩码路径。
+        **compute_episode_ranking_statistics(
+            outputs["log_scores"], labels.bool(), valid, top_k=20
+        ),
+    }
+
+
+@torch.no_grad()
+def compute_episode_ranking_statistics(
+    ranking_scores: Tensor,
+    labels: Tensor,
+    factor_mask: Tensor,
+    top_k: int = 20,
+) -> Dict[str, Tensor]:
+    """计算一个 batch 内逐 episode 的因果检索统计量。
+
+    所有指标都使用 ``log_scores``。它与推理阶段的 ``p * effect`` 严格同序，
+    但不会因为很小概率或效应在 AMP 下乘法下溢而破坏排序。不同 episode 的
+    分数尺度没有必要一致，因此这里先逐 episode 计算，再由 ``summarize`` 做
+    宏平均；这比把整个 epoch 的候选因子混在一起计算更符合面板排序任务。
+
+    AUPRC 采用常见的 non-interpolated average precision 定义；AUROC 直接统计
+    正负样本对的胜率，分数相同记 0.5。Top-k 会先屏蔽无效候选，并在有效
+    候选少于 k 时自动令实际 k 等于有效候选数。
+    """
+
+    if top_k <= 0:
+        raise ValueError("top_k 必须为正整数。")
+    if ranking_scores.ndim != 2:
+        raise ValueError("ranking_scores 必须是 [B,D]。")
+    if labels.shape != ranking_scores.shape or factor_mask.shape != ranking_scores.shape:
+        raise ValueError("ranking_scores、labels 和 factor_mask 必须形状一致。")
+
+    # 指标不参与反向传播。统一到 float32/bool 可避免 AMP 精度影响排序，同时
+    # 保持这些很小的 [B,D] 和 [B,D,D] 临时量远小于主模型激活。
+    scores = ranking_scores.detach().float()
+    valid = factor_mask.detach().bool()
+    positive = labels.detach().bool() & valid
+    negative = (~labels.detach().bool()) & valid
+
+    positive_count = positive.sum(dim=1)
+    negative_count = negative.sum(dim=1)
+    valid_count = valid.sum(dim=1)
+
+    # 无效候选被置为负无穷，只会出现在排序末尾；随后仍用 sorted_valid 明确
+    # 排除它们，因此它们不会进入 AUPRC 或 Top-k 的分母。
+    masked_scores = scores.masked_fill(~valid, float("-inf"))
+    sorted_indices = torch.argsort(masked_scores, dim=1, descending=True, stable=True)
+    sorted_positive = positive.gather(1, sorted_indices)
+    sorted_valid = valid.gather(1, sorted_indices)
+
+    # AUPRC 使用每个真正例出现位置上的 precision，并以该 episode 的正例数
+    # 归一化，即 average precision。连续模型分数通常没有并列；stable sort
+    # 使极少数并列情况仍可确定性复现。
+    cumulative_positive = sorted_positive.cumsum(dim=1).float()
+    valid_rank = sorted_valid.cumsum(dim=1).float().clamp_min(1.0)
+    precision_at_rank = cumulative_positive / valid_rank
+    auprc_per_episode = (
+        precision_at_rank * sorted_positive.float()
+    ).sum(dim=1) / positive_count.clamp_min(1).float()
+
+    # AUROC 是随机抽取一个父节点和一个非父节点时，父节点得分更高的概率。
+    # 直接比较所有正负对可自然处理并列，不依赖外部 sklearn 包。
+    score_difference = scores.unsqueeze(2) - scores.unsqueeze(1)
+    positive_negative_pairs = positive.unsqueeze(2) & negative.unsqueeze(1)
+    auc_wins = (
+        (score_difference > 0.0).float()
+        + 0.5 * (score_difference == 0.0).float()
+    ).masked_fill(~positive_negative_pairs, 0.0)
+    pair_count = positive_count * negative_count
+    auroc_per_episode = auc_wins.sum(dim=(1, 2)) / pair_count.clamp_min(1).float()
+
+    # Top-20 是最终因果排序的直接集合恢复指标。每个 episode 等权，避免有效
+    # 候选较多的面板在宏平均中获得更大权重。
+    positions = torch.arange(scores.shape[1], device=scores.device).unsqueeze(0)
+    selected_count = valid_count.clamp(max=top_k)
+    selected_positions = positions < selected_count.unsqueeze(1)
+    topk_hits = (sorted_positive & selected_positions).sum(dim=1).float()
+    topk_precision_per_episode = topk_hits / selected_count.clamp_min(1).float()
+    topk_recall_per_episode = topk_hits / positive_count.clamp_min(1).float()
+
+    # AUROC 需要同时存在正负类；AUPRC 和 Top-k recall 至少需要一个正类。
+    # 生成数据满足这一条件，但保留显式计数让未来真实数据也不会产生假数值。
+    auc_episode_mask = (positive_count > 0) & (negative_count > 0)
+    topk_episode_mask = (positive_count > 0) & (selected_count > 0)
+    return {
+        "ranking_auprc_sum": auprc_per_episode.masked_fill(
+            ~auc_episode_mask, 0.0
+        ).sum(),
+        "ranking_auroc_sum": auroc_per_episode.masked_fill(
+            ~auc_episode_mask, 0.0
+        ).sum(),
+        "ranking_auc_episode_count": auc_episode_mask.sum(),
+        "top20_precision_sum": topk_precision_per_episode.masked_fill(
+            ~topk_episode_mask, 0.0
+        ).sum(),
+        "top20_recall_sum": topk_recall_per_episode.masked_fill(
+            ~topk_episode_mask, 0.0
+        ).sum(),
+        "top20_episode_count": topk_episode_mask.sum(),
     }
 
 
@@ -226,7 +327,10 @@ def empty_totals() -> Dict[str, float]:
             "causal_num", "causal_den", "effect_num", "effect_abs_num",
             "effect_den", "rank_num", "rank_den", "causal_correct",
             "pair_correct", "pair_count", "true_positive", "positive_count",
-            "true_negative", "negative_count", "batches",
+            "true_negative", "negative_count",
+            "ranking_auprc_sum", "ranking_auroc_sum",
+            "ranking_auc_episode_count", "top20_precision_sum",
+            "top20_recall_sum", "top20_episode_count", "batches",
         )
     }
 
@@ -248,9 +352,22 @@ def summarize(totals: Mapping[str, float], effect_weight: float, rank_weight: fl
         "existence_balanced_accuracy": 0.5 * (recall + specificity),
         "effect_mae": totals["effect_abs_num"] / max(totals["effect_den"], 1.0),
         "pairwise_accuracy": totals["pair_correct"] / max(totals["pair_count"], 1.0),
+        "ranking_auprc": totals["ranking_auprc_sum"] / max(
+            totals["ranking_auc_episode_count"], 1.0
+        ),
+        "ranking_auroc": totals["ranking_auroc_sum"] / max(
+            totals["ranking_auc_episode_count"], 1.0
+        ),
+        "top20_precision": totals["top20_precision_sum"] / max(
+            totals["top20_episode_count"], 1.0
+        ),
+        "top20_recall": totals["top20_recall_sum"] / max(
+            totals["top20_episode_count"], 1.0
+        ),
         "valid_factors": totals["causal_den"],
         "valid_parents": totals["effect_den"],
         "valid_pairs": totals["pair_count"],
+        "valid_ranking_episodes": totals["ranking_auc_episode_count"],
     }
 
 
@@ -541,6 +658,16 @@ def main() -> None:
         chunk_size=args.cross_section_chunk_size,
         use_checkpoint=args.cross_section_checkpoint,
     )
+    if args.init_model is not None:
+        # 第二阶段迁移只继承 full synthetic 学到的表示与排序参数。
+        # 不继承 Adam 动量、学习率进度和随机数状态，避免第一阶段已经衰减到
+        # 末端的优化状态限制 semi synthetic 微调。
+        initialization = torch.load(
+            args.init_model, map_location="cpu", weights_only=False
+        )
+        if initialization["model_config"] != asdict(config):
+            raise ValueError("init-model checkpoint 的模型配置与当前参数不一致。")
+        model.load_state_dict(initialization["model"])
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -596,6 +723,8 @@ def main() -> None:
     }
     if args.resume is not None:
         state["last_checkpoint"] = str(args.resume)
+    if args.init_model is not None:
+        state["initial_model"] = str(args.init_model)
     atomic_json(state_path, state)
     print(
         f"device={device} train={len(primary_dataset)} "
@@ -633,6 +762,7 @@ def main() -> None:
                 train_metrics["loss"] if validation_metrics is None
                 else validation_metrics["loss"]
             )
+            is_best = selection_metric < best_metric
             best_metric = min(best_metric, selection_metric)
             record = {
                 "epoch": epoch, "global_step": global_step,
@@ -642,6 +772,28 @@ def main() -> None:
             }
             with history_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if is_best and args.save_best:
+                # --save-best 是显式的两阶段训练开关。默认不执行本分支，普通
+                # 单阶段训练的保存频率和 checkpoint.pt 行为不会发生变化。
+                # 此处只维护一个固定文件名，因此不会随 epoch 累积 checkpoint。
+                # 最优文件仅保存第二阶段初始化所需的模型，不携带第一阶段的
+                # 优化器/调度器状态；常规 checkpoint.pt 继续负责精确断点续训。
+                best_checkpoint_path = args.output_dir / "best_checkpoint.pt"
+                atomic_checkpoint(
+                    best_checkpoint_path,
+                    {
+                        "format_version": 3,
+                        "checkpoint_type": "best_model",
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "selection_metric": selection_metric,
+                        "model_config": asdict(config),
+                        "model": model.state_dict(),
+                        "arguments": serializable_arguments(args),
+                    },
+                )
+                state["best_checkpoint"] = str(best_checkpoint_path)
+                state["best_epoch"] = epoch
             # scheduler 在 epoch 结束后准备下一轮学习率；最终轮无需越界更新。
             if epoch < args.epochs:
                 scheduler.step()
@@ -674,7 +826,11 @@ def main() -> None:
                     f"lr={current_learning_rate:.3e} "
                     f"loss={train_metrics['loss']:.6f} "
                     f"balanced_acc={train_metrics['existence_balanced_accuracy']:.6f} "
-                    f"pairwise_acc={train_metrics['pairwise_accuracy']:.6f}",
+                    f"pairwise_acc={train_metrics['pairwise_accuracy']:.6f} "
+                    f"auprc={train_metrics['ranking_auprc']:.6f} "
+                    f"auroc={train_metrics['ranking_auroc']:.6f} "
+                    f"top20_precision={train_metrics['top20_precision']:.6f} "
+                    f"top20_recall={train_metrics['top20_recall']:.6f}",
                     flush=True,
                 )
         # 测试仅在全部训练 epoch 完成后执行，不参与梯度、优化器更新或模型选择。
@@ -706,6 +862,10 @@ def main() -> None:
                 f"test_loss={test_metrics['loss']:.6f} "
                 f"test_balanced_acc={test_metrics['existence_balanced_accuracy']:.6f} "
                 f"test_pairwise_acc={test_metrics['pairwise_accuracy']:.6f} "
+                f"test_auprc={test_metrics['ranking_auprc']:.6f} "
+                f"test_auroc={test_metrics['ranking_auroc']:.6f} "
+                f"test_top20_precision={test_metrics['top20_precision']:.6f} "
+                f"test_top20_recall={test_metrics['top20_recall']:.6f} "
                 f"test_effect_mae={test_metrics['effect_mae']:.6f}",
                 flush=True,
             )

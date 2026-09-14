@@ -5,7 +5,8 @@
 --------
 GKX 原始文件包含 ``permno``、``DATE``、94 个经过滞后处理的公司特征和
 ``sic2``，不包含收益 Y，也不包含全市场共享的宏观状态 C。本程序保留真实
-X、股票覆盖情况和特征缺失模式，只合成目标方程 Y 及其监督标签。
+X 和股票覆盖情况，只合成目标方程 Y 及其监督标签。可选的缺失值补全只使用
+当前 episode 内的 X 与随机数，不读取 Y；原始缺失率另存于生成元数据中。
 
 半合成数据中的困难负样本
 --------------------------
@@ -55,8 +56,9 @@ import numpy as np
 import pandas as pd
 
 
-# 数据集输出协议新增 parent_candidate_mask，因此升级到版本 2。
-FORMAT_VERSION = 2
+# v3 允许 feature_mask 表示“经过预处理后可供模型使用”的值；原始观测率
+# 单独写入 episode 元数据。数组名称和形状与 v2 完全相同。
+FORMAT_VERSION = 3
 # 月度源数据缓存格式没有改变，单独保留版本 1，避免无意义地重建 3.8GB 缓存。
 CACHE_FORMAT_VERSION = 1
 # GKX 的股票永久标识符和月末日期列。
@@ -127,12 +129,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-parents", type=int, default=1)
     parser.add_argument("--max-parents", type=int, default=5)
     parser.add_argument(
+        "--parent-sampling-method",
+        choices=("balanced", "uniform"),
+        default="balanced",
+        help=(
+            "balanced 优先选择累计入选次数较少的候选；uniform 在每个 episode "
+            "从全部合格候选中无放回均匀随机抽取。"
+        ),
+    )
+    parser.add_argument(
         "--min-parent-observations", type=int, default=16,
         help="父节点候选特征在 episode 内至少需要的有效观测数。",
     )
     parser.add_argument(
         "--min-parent-observation-rate", type=float, default=0.50,
         help="父节点候选特征相对有效股票月的最低观测率。",
+    )
+    parser.add_argument(
+        "--imputation-method",
+        choices=("none", "temporal-hot-deck"),
+        default="none",
+        help=(
+            "特征缺失处理。temporal-hot-deck 先做资产内时序插值，再从同特征"
+            "随机抽取供体；episode 内完全缺失的特征使用独立 AR(1) 秩过程兜底。"
+        ),
+    )
+    parser.add_argument(
+        "--imputation-jitter", type=float, default=0.02,
+        help="仅对补充值加入的微小高斯扰动标准差；原始观测值不会被修改。",
+    )
+    parser.add_argument(
+        "--imputation-fallback-ar", type=float, default=0.70,
+        help="episode 内整列缺失时，兜底 AR(1) 随机过程的自回归系数。",
     )
     parser.add_argument("--snr-low", type=float, default=0.5)
     parser.add_argument("--snr-high", type=float, default=5.0)
@@ -175,6 +203,10 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if not 0.0 < args.min_parent_observation_rate <= 1.0:
         raise ValueError("--min-parent-observation-rate must be in (0, 1]")
+    if args.imputation_jitter < 0.0:
+        raise ValueError("--imputation-jitter cannot be negative")
+    if not 0.0 <= args.imputation_fallback_ar < 1.0:
+        raise ValueError("--imputation-fallback-ar must be in [0, 1)")
     if not 0.0 < args.snr_low <= args.snr_high:
         raise ValueError("SNR bounds must satisfy 0 < low <= high")
     if args.max_source_rows < 0:
@@ -208,6 +240,38 @@ def write_dataset_readme(output_dir: Path, manifest: Mapping[str, Any]) -> None:
     dimensions = manifest["dimensions"]
     counts = manifest["episode_counts"]
     parent_sampling = manifest["parent_sampling"]
+    if parent_sampling["method"] == "uniform":
+        parent_sampling_description = (
+            "每个 episode 从全部合格候选中无放回均匀随机抽取；历史入选次数"
+            "只用于审计，不影响后续抽样。"
+        )
+    else:
+        parent_sampling_description = (
+            "每个 split 分别维护累计入选次数，优先选择入选次数较少的合格"
+            "特征，并随机打破并列。"
+        )
+    imputation = manifest.get("imputation", {"method": "none"})
+    if imputation["method"] == "temporal-hot-deck":
+        x_description = "股票特征；原始观测或 episode 内补充值；padding 为 0"
+        feature_mask_description = "补全后是否可供模型使用；当前等于广播后的 asset_mask"
+        imputation_description = f"""
+## 缺失值处理
+
+- 当前方法：`{imputation['method']}`。真实观测值保持不变；缺失位置依次使用
+  资产内时序插值、随机同特征供体和整列缺失 AR(1) 截面秩兜底。
+- 补全只读取当前 episode 的 X 和 episode seed，不读取 Y、z 或父节点身份，
+  因此不会以标签信息筛选窗口或候选因子。
+- 原始逐特征观测数、观测率和实际补全比例保存在
+  `generation_metadata.jsonl.gz`，不能把补充值解释为真实 GKX 观测。
+"""
+    else:
+        x_description = "股票特征；缺失和 padding 位置填 0"
+        feature_mask_description = "股票月存在且该特征被真实观测"
+        imputation_description = """
+## 缺失值处理
+
+当前未启用补全；缺失值填 0，并由 `feature_mask=False` 明确屏蔽。
+"""
     arguments = json.dumps(
         manifest["generation_arguments"], ensure_ascii=False, indent=2, sort_keys=True
     )
@@ -219,6 +283,14 @@ def write_dataset_readme(output_dir: Path, manifest: Mapping[str, Any]) -> None:
         )
     else:
         calibration_description = f"`{calibration_name}`"
+    if "audit_arrays" in manifest:
+        audit_description = (
+            "- `audit_observed_feature_mask/`：按训练 shard 对齐保存的原始缺失"
+            "掩码，沿 D 维采用 `np.packbits(..., bitorder='little')` 压缩；"
+            "训练 Dataset 不加载该目录。"
+        )
+    else:
+        audit_description = ""
     content = f"""# {manifest['dataset_name']}
 
 ## 数据规模与划分
@@ -234,12 +306,12 @@ def write_dataset_readme(output_dir: Path, manifest: Mapping[str, Any]) -> None:
 
 | 数组 | dtype | shape | 训练角色 | 含义 |
 |---|---|---|---|---|
-| `X` | float32 | `[E,N,T,D]` | 模型输入 | 股票特征；缺失和 padding 位置填 0 |
+| `X` | float32 | `[E,N,T,D]` | 模型输入 | {x_description} |
 | `Y` | float32 | `[E,N,T]` | 模型输入 | 合成目标；无效位置填 0 |
 | `z` | bool | `[E,D]` | 分类监督 | 是否为 `Y` 的直接父特征 |
 | `tau_direct` | float32 | `[E,D]` | 排序监督 | q20→q80 的受控直接效应，非父特征为 0 |
 | `asset_mask` | bool | `[E,N,T]` | 有效性掩码 | 股票—月份是否存在 |
-| `feature_mask` | bool | `[E,N,T,D]` | 有效性掩码 | 特征值是否真实可用 |
+| `feature_mask` | bool | `[E,N,T,D]` | 有效性掩码 | {feature_mask_description} |
 | `parent_candidate_mask` | bool | `[E,D]` | 监督候选掩码 | 是否达到父节点最低观测数和观测率 |
 | `target_mask` | bool | `[E,N,T]` | 损失掩码 | `Y` 是否参与损失；当前等于 `asset_mask` |
 | `time_padding_mask` | bool | `[E,T]` | 注意力掩码 | PyTorch 语义；True 表示整期应忽略 |
@@ -251,14 +323,16 @@ def write_dataset_readme(output_dir: Path, manifest: Mapping[str, Any]) -> None:
 训练时重复实现掩码语义，并允许以后为真实缺失 `Y` 扩展 `target_mask`。
 `q_low`、`q_high` 只定义 tau 的干预端点，不是模型输入或监督标签。
 
+{imputation_description}
+
 ## 父节点候选与均衡抽样
 
 - 特征至少有 {parent_sampling['minimum_observations']} 个有效观测，并且相对有效
   股票月的观测率至少为 {parent_sampling['minimum_observation_rate']:.0%}，才会令
   `parent_candidate_mask=True` 并进入父节点候选集合。
-- 每个 train/validation/test split 分别维护94个特征的累计父节点入选次数；
-  每个 episode 优先从当前入选次数最少的合格特征中选择，并随机打破并列。
-- “均匀”仅针对当期合格候选；不满足完整率的特征不会为了凑均匀而成为父节点。
+- 抽样方法：{parent_sampling_description}
+- “均匀”仅针对当期合格候选。补全模式下全部 94 个特征具有同等资格，
+  不会为了凑候选数量而拒绝窗口或定向挑选高覆盖特征。
 - 各 split 最终的逐特征入选次数记录在 `manifest.json` 的
   `parent_sampling.selection_counts_by_split`。
 
@@ -268,6 +342,7 @@ def write_dataset_readme(output_dir: Path, manifest: Mapping[str, Any]) -> None:
   q_low/q_high、目标机制参数、困难负样本索引，以及该生成器特有的复现信息。
 - `manifest.json`：全局结构、特征顺序、分片清单、mask/tau 语义和完整运行参数。
 - {calibration_description}；仅供生成/校准全合成数据使用，不由训练加载器读取。
+{audit_description}
 - `README.md`：本说明。
 
 ## 复现定位
@@ -481,6 +556,158 @@ def rank_transform(X_obs: np.ndarray, asset_mask: np.ndarray) -> Tuple[np.ndarra
     return transformed, feature_mask
 
 
+def impute_rank_panel(
+    observed_ranks: np.ndarray,
+    asset_mask: np.ndarray,
+    observed_feature_mask: np.ndarray,
+    rng: np.random.Generator,
+    jitter_std: float = 0.02,
+    fallback_ar: float = 0.70,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """在不使用 Y 的前提下补齐有效股票月中的特征，并返回可用性掩码。
+
+    补全分三层进行：
+
+    1. 某个资产—特征序列至少有一个真实观测时，沿时间轴线性插值；窗口
+       两端没有观测的一侧使用最近端点值。这一步保留资产自身的时间结构。
+    2. 某资产的某特征在整个窗口都缺失，但该特征在其他资产有观测时，
+       从同一 episode、同一特征的可观测资产中随机抽取供体轨迹。随机供体
+       避免总是偏向某只股票，也不依据标签或父节点身份筛选候选因子。
+    3. 若某个特征在整个 episode 完全缺失，则为每只有效资产生成独立 AR(1)
+       隐变量，并逐月映射成截面秩。这只是使候选结构保持完整的兜底输入，
+       不伪装成真实 GKX 观测；原始观测率会写入 episode 元数据供审计。
+
+    只有原本缺失的位置可加入微小 jitter，真实观测值会在最后逐元素恢复。
+    返回的 ``usable_feature_mask`` 在所有 ``asset_mask=True`` 位置均为 True，
+    因而 94 个特征都能公平进入父节点候选池；padding 位置仍为 False/0。
+    """
+
+    if observed_ranks.ndim != 3:
+        raise ValueError("observed_ranks must have shape [N,T,D]")
+    if asset_mask.shape != observed_ranks.shape[:2]:
+        raise ValueError("asset_mask must have shape [N,T]")
+    if observed_feature_mask.shape != observed_ranks.shape:
+        raise ValueError("observed_feature_mask must have shape [N,T,D]")
+    if jitter_std < 0.0:
+        raise ValueError("jitter_std cannot be negative")
+    if not 0.0 <= fallback_ar < 1.0:
+        raise ValueError("fallback_ar must be in [0,1)")
+    if np.any(observed_feature_mask & ~asset_mask[:, :, None]):
+        raise ValueError("observed_feature_mask cannot cross asset_mask")
+
+    num_assets, num_times, num_features = observed_ranks.shape
+    usable_feature_mask = np.broadcast_to(
+        asset_mask[:, :, None], observed_ranks.shape
+    ).copy()
+
+    # 先把真实缺失恢复成 NaN。下面的前向/后向扫描同时处理所有 N×D 序列，
+    # 避免为每个资产—特征调用一次 np.interp，生成数千个 episode 时更高效。
+    completed = np.where(
+        observed_feature_mask, observed_ranks, np.nan
+    ).astype(np.float32, copy=False)
+    left_times = np.full(
+        (num_assets, num_times, num_features), -1, dtype=np.int16
+    )
+    last_values = np.full((num_assets, num_features), np.nan, dtype=np.float32)
+    last_times = np.full((num_assets, num_features), -1, dtype=np.int16)
+    for time_index in range(num_times):
+        observed_now = observed_feature_mask[:, time_index, :]
+        last_values = np.where(
+            observed_now, observed_ranks[:, time_index, :], last_values
+        )
+        last_times = np.where(observed_now, time_index, last_times)
+        missing_now = ~observed_now
+        completed[:, time_index, :] = np.where(
+            missing_now, last_values, completed[:, time_index, :]
+        )
+        left_times[:, time_index, :] = last_times
+
+    next_values = np.full((num_assets, num_features), np.nan, dtype=np.float32)
+    next_times = np.full((num_assets, num_features), num_times, dtype=np.int16)
+    for time_index in range(num_times - 1, -1, -1):
+        observed_now = observed_feature_mask[:, time_index, :]
+        next_values = np.where(
+            observed_now, observed_ranks[:, time_index, :], next_values
+        )
+        next_times = np.where(observed_now, time_index, next_times)
+        missing_now = ~observed_now
+        has_left = left_times[:, time_index, :] >= 0
+        has_right = next_times < num_times
+        both_sides = missing_now & has_left & has_right
+        only_right = missing_now & ~has_left & has_right
+
+        # completed 当前保存左端点值；按到左右观测点的时间距离做线性插值。
+        denominator = np.maximum(
+            next_times - left_times[:, time_index, :], 1
+        ).astype(np.float32)
+        right_weight = (time_index - left_times[:, time_index, :]) / denominator
+        interpolated = (
+            completed[:, time_index, :] * (1.0 - right_weight)
+            + next_values * right_weight
+        )
+        completed[:, time_index, :] = np.where(
+            both_sides, interpolated, completed[:, time_index, :]
+        )
+        completed[:, time_index, :] = np.where(
+            only_right, next_values, completed[:, time_index, :]
+        )
+
+    # 对整个窗口都没有观测的资产—特征序列，随机抽取同特征供体。供体轨迹
+    # 已经过时序插值，所以即使供体某个月没有原始记录，也能提供有限值。
+    has_any_observation = observed_feature_mask.any(axis=1)  # [N,D]
+    active_assets = asset_mask.any(axis=1)
+    entirely_missing_features: List[int] = []
+    for feature_index in range(num_features):
+        donors = np.flatnonzero(has_any_observation[:, feature_index])
+        recipients = np.flatnonzero(
+            active_assets & ~has_any_observation[:, feature_index]
+        )
+        if donors.size:
+            if recipients.size:
+                chosen_donors = rng.choice(donors, size=recipients.size, replace=True)
+                completed[recipients, :, feature_index] = completed[
+                    chosen_donors, :, feature_index
+                ]
+            continue
+        entirely_missing_features.append(feature_index)
+
+    # episode 内整列缺失时没有真实供体可用。独立 AR(1) 只作为透明的兜底，
+    # 并保持逐月截面秩的边际尺度与真实 rank_transform 输出一致。
+    innovation_scale = math.sqrt(max(1.0 - fallback_ar * fallback_ar, 1e-8))
+    for feature_index in entirely_missing_features:
+        previous = rng.standard_normal(num_assets)
+        for time_index in range(num_times):
+            latent = (
+                fallback_ar * previous
+                + innovation_scale * rng.standard_normal(num_assets)
+            )
+            active = np.flatnonzero(asset_mask[:, time_index])
+            if active.size > 1:
+                order = np.argsort(latent[active], kind="stable")
+                ranks = np.empty(active.size, dtype=np.float32)
+                ranks[order] = np.arange(active.size, dtype=np.float32)
+                completed[active, time_index, feature_index] = (
+                    2.0 * ranks / float(active.size - 1) - 1.0
+                )
+            elif active.size == 1:
+                completed[active[0], time_index, feature_index] = 0.0
+            previous = latent
+
+    # jitter 仅打破供体复制或端点外推产生的大量完全相同值。随后恢复真实值，
+    # 保证任何原始观测在补全前后逐元素相等。
+    imputed_positions = usable_feature_mask & ~observed_feature_mask
+    if jitter_std > 0.0 and np.any(imputed_positions):
+        completed[imputed_positions] += rng.normal(
+            0.0, jitter_std, size=int(imputed_positions.sum())
+        ).astype(np.float32)
+    np.clip(completed, -1.0, 1.0, out=completed)
+    completed[observed_feature_mask] = observed_ranks[observed_feature_mask]
+    completed[~usable_feature_mask] = 0.0
+    if not np.isfinite(completed).all():
+        raise RuntimeError("imputation left NaN/Inf in the completed feature panel")
+    return completed.astype(np.float32, copy=False), usable_feature_mask
+
+
 def transformed_value(values: np.ndarray, code: int, threshold: float) -> np.ndarray:
     """执行父节点在目标结构方程中的线性或随机非线性基函数。"""
 
@@ -591,16 +818,20 @@ def synthesize_target(
     snr_low: float,
     snr_high: float,
     negative_threshold: float,
+    parent_sampling_method: str = "balanced",
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
     """生成 Y、直接父节点标签 z 和 q20→q80 直接效应 tau_direct。
 
-    父节点只从达到最低有效观测数和观测率的特征中抽取。为避免完整特征
-    长期垄断父节点标签，优先选择当前 split 中累计入选次数较少的候选特征，
-    并用 episode RNG 随机打破并列。目标机制覆盖加性、交互和异方差三类。
+    父节点只从达到最低有效观测数和观测率的特征中抽取。balanced 模式优先
+    选择当前 split 中累计入选次数较少的候选，并随机打破并列；uniform 模式
+    则在每个 episode 独立地均匀无放回抽样。目标机制覆盖加性、交互和
+    异方差三类。
     """
     num_features = X.shape[-1]
     if parent_selection_counts.shape != (num_features,):
         raise ValueError("parent_selection_counts must have shape [D]")
+    if parent_sampling_method not in {"balanced", "uniform"}:
+        raise ValueError("parent_sampling_method must be balanced or uniform")
 
     # 相对完整率以真实存在的股票月为分母，不把股票 padding 计作特征缺失。
     valid_asset_count = int(asset_mask.sum())
@@ -622,12 +853,19 @@ def synthesize_target(
     parent_count = int(
         rng.integers(min_parents, min(max_parents, candidates.size) + 1)
     )
-    # 先按累计入选次数升序，再用随机数打破相同次数的并列。
-    random_tie_breaker = rng.random(candidates.size)
-    balanced_order = np.lexsort(
-        (random_tie_breaker, parent_selection_counts[candidates])
-    )
-    parents = np.sort(candidates[balanced_order[:parent_count]]).astype(np.int64)
+    if parent_sampling_method == "uniform":
+        # 所有合格候选具有完全相同的抽样概率；不按缺失率、相关性或历史
+        # 入选次数进行定向挑选，适合检验随机候选结构的泛化能力。
+        parents = np.sort(
+            rng.choice(candidates, size=parent_count, replace=False)
+        ).astype(np.int64)
+    else:
+        # 先按累计入选次数升序，再用随机数打破相同次数的并列。
+        random_tie_breaker = rng.random(candidates.size)
+        balanced_order = np.lexsort(
+            (random_tie_breaker, parent_selection_counts[candidates])
+        )
+        parents = np.sort(candidates[balanced_order[:parent_count]]).astype(np.int64)
     parent_selection_counts[parents] += 1
     z = np.zeros(num_features, dtype=bool)
     z[parents] = True
@@ -722,6 +960,7 @@ def synthesize_target(
     }
     metadata = {
         "parent_indices": parents.tolist(),
+        "parent_sampling_method": parent_sampling_method,
         "parent_candidate_count": int(parent_candidate_mask.sum()),
         "parent_observation_counts": observation_counts[parents].tolist(),
         "parent_observation_rates": observation_rates[parents].tolist(),
@@ -767,8 +1006,17 @@ class CalibrationAccumulator:
         self.lag_sum_xx = np.zeros(num_features, dtype=np.float64)
         self.lag_sum_yy = np.zeros(num_features, dtype=np.float64)
         self.lag_sum_xy = np.zeros(num_features, dtype=np.float64)
-        self.corr_count = 0
-        self.corr_sum = np.zeros(num_features, dtype=np.float64)
+        # 截面相关必须按“特征对共同可观测”的样本计算。单个全局 count/sum
+        # 会把缺失值的落盘占位 0 当成真实观测，使相关矩阵混入共同缺失模式。
+        # 以下 D×D 充分统计量分别保存每对特征的共同样本数、左变量一阶/二阶
+        # 和以及交叉乘积；内存开销很小，且无需保存任何真实股票记录。
+        self.corr_count = np.zeros((num_features, num_features), dtype=np.float64)
+        self.corr_sum_left = np.zeros(
+            (num_features, num_features), dtype=np.float64
+        )
+        self.corr_square_sum_left = np.zeros(
+            (num_features, num_features), dtype=np.float64
+        )
         self.corr_outer = np.zeros((num_features, num_features), dtype=np.float64)
 
     def update(
@@ -804,12 +1052,20 @@ class CalibrationAccumulator:
         self.lag_sum_xy += (left_valid * right_valid).sum(axis=(0, 1))
 
         rows = X[asset_mask]
+        row_mask = feature_mask[asset_mask]
         if rows.shape[0] > 2048:
-            rows = rows[rng.choice(rows.shape[0], size=2048, replace=False)]
-        rows = rows.astype(np.float64, copy=False)
-        self.corr_count += rows.shape[0]
-        self.corr_sum += rows.sum(axis=0)
-        self.corr_outer += rows.T @ rows
+            selected_rows = rng.choice(rows.shape[0], size=2048, replace=False)
+            rows = rows[selected_rows]
+            row_mask = row_mask[selected_rows]
+        # 无效位置先置零只用于矩阵乘法；共同观测 mask 会明确决定每一对
+        # 特征的样本集合，所以这些零不会被当成观测值。
+        valid = row_mask.astype(np.float64, copy=False)
+        values = np.where(row_mask, rows, 0.0).astype(np.float64, copy=False)
+        square_values = values * values
+        self.corr_count += valid.T @ valid
+        self.corr_sum_left += values.T @ valid
+        self.corr_square_sum_left += square_values.T @ valid
+        self.corr_outer += values.T @ values
 
     def save(self, path: Path, feature_names: Sequence[str]) -> None:
         """由累计矩计算相关系数，并按固定特征顺序保存校准文件。"""
@@ -823,16 +1079,31 @@ class CalibrationAccumulator:
         lag_corr = np.nan_to_num(lag_corr, nan=0.70, posinf=0.95, neginf=0.0)
         lag_corr = np.clip(lag_corr, -0.95, 0.98)
 
-        if self.corr_count > 1:
-            covariance_matrix = (
-                self.corr_outer - np.outer(self.corr_sum, self.corr_sum) / self.corr_count
-            ) / (self.corr_count - 1)
-            scale = np.sqrt(np.maximum(np.diag(covariance_matrix), 1e-12))
-            correlation = covariance_matrix / np.outer(scale, scale)
-            correlation = np.nan_to_num(correlation, nan=0.0, posinf=0.0, neginf=0.0)
-            np.fill_diagonal(correlation, 1.0)
-        else:
-            correlation = np.eye(self.num_features, dtype=np.float64)
+        # 对 (i,j)，corr_sum_left[i,j] 是两列共同观测位置上的 sum(X_i)；
+        # 其转置正好是同一位置上的 sum(X_j)。二阶和同理，因此下面得到严格
+        # 的 pairwise-complete Pearson 相关，不受任一列缺失率或占位值影响。
+        pair_count = np.maximum(self.corr_count, 1.0)
+        sum_left = self.corr_sum_left
+        sum_right = self.corr_sum_left.T
+        centered_cross = self.corr_outer - sum_left * sum_right / pair_count
+        centered_square_left = (
+            self.corr_square_sum_left - sum_left * sum_left / pair_count
+        )
+        centered_square_right = (
+            self.corr_square_sum_left.T - sum_right * sum_right / pair_count
+        )
+        denominator = np.sqrt(
+            np.maximum(centered_square_left * centered_square_right, 1e-12)
+        )
+        correlation = centered_cross / denominator
+        correlation = np.where(self.corr_count > 1.0, correlation, 0.0)
+        correlation = np.nan_to_num(
+            correlation, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        correlation = np.clip(correlation, -1.0, 1.0)
+        # 浮点矩阵乘法可能产生 1e-15 级非对称，显式对称化便于复现实验。
+        correlation = 0.5 * (correlation + correlation.T)
+        np.fill_diagonal(correlation, 1.0)
 
         # 校准量不是训练张量，因此使用可读 JSON 而不额外创建 NPZ。
         atomic_json(
@@ -973,17 +1244,42 @@ def main() -> None:
                     asset_mask[target_rows, time_index] = True
                     X_obs[target_rows, time_index, :] = month_values[source_rows]
 
-                # 截面秩变换并区分“股票月不存在”和“具体特征缺失”。
-                X, feature_mask = rank_transform(X_obs, asset_mask)
-                # 真实 X 不改动；这里只合成目标方程及已知的 z/tau 监督。
+                # 先保留原始截面秩和原始观测掩码。启用补全时，训练使用的
+                # feature_mask 表示补全后的可用性；真实缺失率仍单独写入元数据。
+                observed_X, observed_feature_mask = rank_transform(X_obs, asset_mask)
+                if args.imputation_method == "temporal-hot-deck":
+                    # 补全和目标机制使用由 episode seed 派生的独立随机流。
+                    # 因此缺失位置多少只影响补全，不会通过“消耗了多少随机数”
+                    # 间接改变父节点抽样，候选结构与缺失模式在 RNG 层面解耦。
+                    imputation_rng = np.random.default_rng(
+                        np.random.SeedSequence([episode_seed, 1])
+                    )
+                    target_rng = np.random.default_rng(
+                        np.random.SeedSequence([episode_seed, 2])
+                    )
+                    X, feature_mask = impute_rank_panel(
+                        observed_X,
+                        asset_mask,
+                        observed_feature_mask,
+                        imputation_rng,
+                        jitter_std=args.imputation_jitter,
+                        fallback_ar=args.imputation_fallback_ar,
+                    )
+                else:
+                    X, feature_mask = observed_X, observed_feature_mask
+                    target_rng = rng
+
+                # 目标、父节点和困难负例都基于模型实际收到的 X 构造。补全模式
+                # 下所有 94 个特征拥有相同候选资格，不再因原始缺失率筛掉特征。
                 target_arrays, target_metadata = synthesize_target(
-                    X, asset_mask, feature_mask, rng,
+                    X, asset_mask, feature_mask, target_rng,
                     args.min_parents, args.max_parents,
                     args.min_parent_observations,
                     args.min_parent_observation_rate,
                     parent_selection_counts,
                     args.snr_low, args.snr_high,
                     args.hard_negative_threshold,
+                    parent_sampling_method=args.parent_sampling_method,
                 )
                 episode_arrays: Dict[str, np.ndarray] = {
                     "X": X.astype(np.float32, copy=False),
@@ -996,7 +1292,19 @@ def main() -> None:
                     "target_mask": asset_mask.copy(),
                     "time_padding_mask": ~asset_mask.any(axis=0),
                 }
-                calibration.update(X, asset_mask, feature_mask, rng)
+                # 校准中的覆盖率继续反映原始 GKX 缺失，而相关结构基于实际输入 X。
+                calibration.update(X, asset_mask, observed_feature_mask, rng)
+                valid_stock_months = max(int(asset_mask.sum()), 1)
+                original_observation_counts = observed_feature_mask.sum(
+                    axis=(0, 1)
+                ).astype(np.int64)
+                original_observation_rates = (
+                    original_observation_counts / valid_stock_months
+                )
+                usable_count = int(feature_mask.sum())
+                imputed_count = int(
+                    (feature_mask & ~observed_feature_mask).sum()
+                )
                 position_in_shard = len(pending)
                 pending.append(episode_arrays)
                 metadata = {
@@ -1010,6 +1318,27 @@ def main() -> None:
                     "window_end": int(dates[-1]),
                     "num_real_assets": selected_count,
                     "market_state_dim": 0,
+                    "imputation_method": args.imputation_method,
+                    "imputation_rng_stream": (
+                        "SeedSequence([episode_seed, 1])"
+                        if args.imputation_method == "temporal-hot-deck"
+                        else None
+                    ),
+                    "target_rng_stream": (
+                        "SeedSequence([episode_seed, 2])"
+                        if args.imputation_method == "temporal-hot-deck"
+                        else "continuation of episode RNG"
+                    ),
+                    "imputed_value_count": imputed_count,
+                    "imputed_fraction_of_usable_values": (
+                        imputed_count / max(usable_count, 1)
+                    ),
+                    "original_feature_observation_counts": (
+                        original_observation_counts.tolist()
+                    ),
+                    "original_feature_observation_rates": (
+                        original_observation_rates.tolist()
+                    ),
                     # 以下内容只用于复现、审计或额外消融，不进入训练 NPZ。
                     "stock_ids": stock_ids.tolist(),
                     "dates": dates.astype(np.int32).tolist(),
@@ -1056,19 +1385,49 @@ def main() -> None:
         "C_handling": "Pass C=None and construct the model with market_state_dim=0.",
         "mask_semantics": {
             "asset_mask": "1 iff the stock-month row exists; 0 also marks padded assets",
-            "feature_mask": "1 iff the stock-month exists and that characteristic was observed",
-            "parent_candidate_mask": "1 iff the feature meets both parent observation thresholds; z/tau losses must be restricted to this set",
+            "feature_mask": (
+                "1 iff the stock-month characteristic is usable after preprocessing; "
+                "with temporal-hot-deck this equals broadcast(asset_mask), while raw "
+                "observation rates remain in generation metadata"
+            ),
+            "parent_candidate_mask": "1 iff the post-preprocessing feature meets both parent observation thresholds; z/tau losses must be restricted to this set",
             "target_mask": "1 iff synthetic Y is valid; identical to asset_mask in these episodes",
             "time_padding_mask": "PyTorch convention: 1 iff every asset is absent and the time step must be ignored",
+        },
+        "imputation": {
+            "method": args.imputation_method,
+            "jitter_standard_deviation": args.imputation_jitter,
+            "fallback_ar_coefficient": args.imputation_fallback_ar,
+            "uses_target_or_labels": False,
+            "observed_values_preserved_exactly": True,
+            "raw_missingness_audit": (
+                "generation_metadata.jsonl.gz stores original per-feature "
+                "observation counts/rates and the imputed fraction for each episode"
+            ),
         },
         "tau_semantics": "controlled direct q20-to-q80 effect, averaged over asset_mask=1",
         "parent_sampling": {
             "minimum_observations": args.min_parent_observations,
             "minimum_observation_rate": args.min_parent_observation_rate,
-            "method": "least-selected eligible features first, with random tie-breaking, balanced independently within each split",
+            "method": args.parent_sampling_method,
+            "method_description": (
+                "uniform sampling without replacement from all eligible features "
+                "in every episode"
+                if args.parent_sampling_method == "uniform"
+                else "least-selected eligible features first, with random "
+                "tie-breaking, balanced independently within each split"
+            ),
             "selection_counts_by_split": parent_selection_counts_by_split,
         },
-        "preprocessing": "monthly cross-sectional average rank mapped to [-1,1]; missing values are 0 with masks retained",
+        "preprocessing": (
+            "monthly cross-sectional average rank mapped to [-1,1]; "
+            + (
+                "missing active values completed by temporal-hot-deck and marked "
+                "usable; original missingness retained in episode metadata"
+                if args.imputation_method == "temporal-hot-deck"
+                else "missing values are 0 with observed-value masks retained"
+            )
+        ),
         "split_date_ranges": {
             split: ([int(values[0]), int(values[-1])] if len(values) else None)
             for split, values in split_dates.items()

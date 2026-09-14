@@ -11,16 +11,20 @@ X 的完整因果结构
 每个 episode 随机抽取一个特征拓扑序，生成稀疏同时刻 DAG，并在分片外保存
 ``feature_adjacency`` 和 ``feature_scm_coefficients``；每个特征还具有保存于
 ``feature_ar_coefficients`` 的自身滞后边。DAG 的边抽样会偏向真实数据中高
-相关的特征对，AR 系数、缺失率和资产覆盖率也由真实训练期校准。生成完整
-潜在 X 后，再施加股票上市区间和具有持续性的特征缺失过程。
+相关的特征对，AR 系数、缺失率和资产覆盖率也由真实训练期校准。为了避免
+高持久性与同刻 DAG 传播叠加后让几乎所有 X 都高度共线，生成器会分别缩放
+结构边和 AR 系数；缩放量作为命令行参数及 manifest 字段显式保存。生成完整
+潜在 X 后，正式训练输入直接使用 ``complete_rank_x``，不再先制造缺失再
+补全。真实分布校准得到的持续性缺失过程仍会独立生成，但只以 bit-packed
+审计分片保存，不进入训练 DataLoader，也不影响父节点候选资格。
 
 Y 与监督
 --------
 目标机制与半合成脚本共用同一实现，输出 z 和 q20→q80 受控直接效应
 tau_direct。全合成 X 图已知，因此以后可以扩展总效应 tau_total；当前训练
 分片只保存论文主任务需要的直接效应，不把祖先总效应与直接父节点混用。
-父节点只从达到最低观测数和观测率的特征中选择，并在每个数据 split 内按
-历史入选次数进行均衡抽样；训练分片保存 ``parent_candidate_mask``。
+父节点从完整的 94 维统一候选池中均匀无放回抽样；父节点数量在给定区间内逐
+episode 随机变化。训练分片保存 ``parent_candidate_mask``。
 
 当前 GKX DataShare 没有宏观状态 C，因此本程序固定 K=0、不保存 C 数组；
 训练时使用 ``market_state_dim=0`` 和 ``C=None``。
@@ -39,7 +43,7 @@ from functools import lru_cache
 # Path 用于构造不依赖当前工作目录的项目路径。
 from pathlib import Path
 # 类型标注明确校准字典和输出张量容器。
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 # NumPy 负责 SCM、掩码、张量及 NPZ 数据处理。
 import numpy as np
@@ -49,6 +53,7 @@ from generate_semi_synthetic import (
     CalibrationAccumulator,
     MIN_QUANTILE_OBSERVATIONS,
     atomic_json,
+    atomic_npz,
     build_month_cache,
     feature_columns,
     find_project_root,
@@ -61,8 +66,9 @@ from generate_semi_synthetic import (
 )
 
 
-# 输出新增 parent_candidate_mask，与半合成协议同步升级到版本 2。
-FORMAT_VERSION = 2
+# v4 不改变 Dataset 的训练数组形状，但明确把完整合成面板作为 Full 的训练
+# 视图；真实缺失掩码只作审计。这一版本号用于防止与旧 hot-deck Full 数据混淆。
+FORMAT_VERSION = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,15 +104,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-episodes", type=int, default=32)
     parser.add_argument("--episodes-per-shard", type=int, default=8)
     # Y 的直接父节点数、目标信噪比和困难负样本判定阈值。
-    parser.add_argument("--min-parents", type=int, default=1)
-    parser.add_argument("--max-parents", type=int, default=5)
+    parser.add_argument("--min-parents", type=int, default=10)
+    parser.add_argument("--max-parents", type=int, default=20)
+    parser.add_argument(
+        "--test-parent-count",
+        type=int,
+        default=0,
+        help=(
+            "测试集固定父节点数；0 表示沿用训练/验证的 min-max 分布。"
+            "正式上界测试可设为 20。"
+        ),
+    )
+    parser.add_argument(
+        "--parent-sampling-method",
+        choices=("uniform", "balanced"),
+        default="uniform",
+        help=(
+            "uniform 在每个 episode 从全部 D 个特征中无放回均匀抽样；"
+            "balanced 仅为复现旧数据保留。"
+        ),
+    )
     parser.add_argument(
         "--min-parent-observations", type=int, default=16,
-        help="父节点候选特征在 episode 内至少需要的有效观测数。",
+        help="完整训练面板的最低有效股票月数；不足时拒绝生成。",
     )
     parser.add_argument(
         "--min-parent-observation-rate", type=float, default=0.50,
-        help="父节点候选特征相对有效股票月的最低观测率。",
+        help="完整训练面板的最低观测率一致性检查；正式 Full 中应恒为 1。",
     )
     parser.add_argument("--snr-low", type=float, default=0.5)
     parser.add_argument("--snr-high", type=float, default=5.0)
@@ -114,6 +138,30 @@ def parse_args() -> argparse.Namespace:
     # 特征动态 SCM、burn-in 与缺失 Markov 过程的控制参数。
     parser.add_argument("--expected-indegree", type=float, default=2.0)
     parser.add_argument("--max-indegree", type=int, default=5)
+    parser.add_argument(
+        "--structural-coefficient-scale",
+        type=float,
+        default=0.65,
+        help=(
+            "同时刻 DAG 边系数的全局缩放。默认 0.65 用于保留结构相关性，"
+            "同时避免完整面板中相关性沿多层 DAG 普遍放大。"
+        ),
+    )
+    parser.add_argument(
+        "--ar-coefficient-scale",
+        type=float,
+        default=0.85,
+        help=(
+            "真实 lag-1 校准系数的缩放。默认 0.85 保留时间持续性，但降低"
+            "高 AR 与同刻结构传播叠加造成的全局共线性。"
+        ),
+    )
+    parser.add_argument(
+        "--max-absolute-ar-coefficient",
+        type=float,
+        default=0.95,
+        help="缩放后 AR 系数的绝对值上限，必须小于 1。",
+    )
     parser.add_argument("--burn-in", type=int, default=20)
     parser.add_argument("--missing-persistence", type=float, default=0.90)
     parser.add_argument(
@@ -124,6 +172,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-windows", type=int, default=32)
     parser.add_argument("--calibration-train-fraction", type=float, default=0.70)
     parser.add_argument("--min-asset-coverage", type=float, default=0.80)
+    parser.add_argument(
+        "--correlation-audit-rows",
+        type=int,
+        default=4096,
+        help=(
+            "每个 episode 最多抽取多少个有效股票月计算 X 相关性审计；"
+            "0 表示关闭。审计使用独立随机流，不改变 X、Y 或父节点。"
+        ),
+    )
     # 全局复现 seed、CSV chunk 大小和烟雾测试截断开关。
     parser.add_argument("--seed", type=int, default=20260907)
     parser.add_argument("--chunksize", type=int, default=50_000)
@@ -150,6 +207,8 @@ def validate_args(args: argparse.Namespace, num_features: int) -> None:
             raise ValueError(f"--{name.replace('_', '-')} cannot be negative")
     if not 1 <= args.min_parents <= args.max_parents <= num_features:
         raise ValueError("parent bounds must satisfy 1 <= min <= max <= D")
+    if not 0 <= args.test_parent_count <= num_features:
+        raise ValueError("--test-parent-count must satisfy 0 <= count <= D")
     if not MIN_QUANTILE_OBSERVATIONS <= args.min_parent_observations <= args.num_assets * args.time_steps:
         raise ValueError(
             f"--min-parent-observations must be in [{MIN_QUANTILE_OBSERVATIONS}, "
@@ -161,6 +220,12 @@ def validate_args(args: argparse.Namespace, num_features: int) -> None:
         raise ValueError("SNR bounds must satisfy 0 < low <= high")
     if args.expected_indegree < 0.0:
         raise ValueError("--expected-indegree cannot be negative")
+    if args.structural_coefficient_scale <= 0.0:
+        raise ValueError("--structural-coefficient-scale must be positive")
+    if args.ar_coefficient_scale <= 0.0:
+        raise ValueError("--ar-coefficient-scale must be positive")
+    if not 0.0 < args.max_absolute_ar_coefficient < 1.0:
+        raise ValueError("--max-absolute-ar-coefficient must be in (0, 1)")
     if args.burn_in < 0:
         raise ValueError("--burn-in cannot be negative")
     if not 0.0 <= args.missing_persistence < 1.0:
@@ -171,6 +236,8 @@ def validate_args(args: argparse.Namespace, num_features: int) -> None:
         raise ValueError("--calibration-train-fraction must be in (0, 1]")
     if not 0.0 < args.min_asset_coverage <= 1.0:
         raise ValueError("--min-asset-coverage must be in (0, 1]")
+    if args.correlation_audit_rows < 0:
+        raise ValueError("--correlation-audit-rows cannot be negative")
 
 
 def read_calibration(path: Path, expected_features: Sequence[str]) -> Dict[str, np.ndarray]:
@@ -245,16 +312,22 @@ def build_reference_calibration(
         with np.load(cache_path / f"month_{date_value}.npz", allow_pickle=False) as data:
             return data["stock_ids"].copy(), data["X_obs"].copy()
 
-    # 校准使用独立子随机流，不消耗后续训练 episode 的随机序列。
-    rng = np.random.default_rng(np.random.SeedSequence(args.seed).spawn(1)[0])
+    # 使用带用途编号的独立随机流。它与后续 split/episode 随机流没有重叠，
+    # 因而增加校准窗口数量不会改变正式合成任务的结构和标签抽样。
+    rng = np.random.default_rng(np.random.SeedSequence([args.seed, 100]))
     accumulator = CalibrationAccumulator(len(features))
     successful = 0
-    attempts = 0
-    while successful < args.calibration_windows:
-        attempts += 1
-        if attempts > args.calibration_windows * 20:
-            raise RuntimeError("could not sample enough reference windows with eligible stocks")
-        start = int(rng.choice(starts))
+    if args.calibration_windows > starts.size:
+        raise ValueError(
+            f"requested {args.calibration_windows} unique calibration windows, "
+            f"but the GKX training period only provides {starts.size}"
+        )
+    # 无放回遍历随机排列后的窗口起点，保证成功窗口对应不同的日历区间。
+    # 个别窗口可能因股票覆盖不足被跳过，因此遍历全部起点而非只取前 K 个。
+    for start_value in rng.permutation(starts):
+        if successful >= args.calibration_windows:
+            break
+        start = int(start_value)
         dates = train_dates[start : start + args.time_steps]
         month_data = [load_month(int(date)) for date in dates]
         all_ids = np.concatenate([item[0] for item in month_data])
@@ -280,6 +353,12 @@ def build_reference_calibration(
         X, mask = rank_transform(X_obs, asset_mask)
         accumulator.update(X, asset_mask, mask, rng)
         successful += 1
+
+    if successful < args.calibration_windows:
+        raise RuntimeError(
+            f"only {successful} unique calibration windows contained eligible "
+            f"stocks; requested {args.calibration_windows}"
+        )
 
     accumulator.save(destination, features)
     return read_calibration(destination, features)
@@ -316,12 +395,19 @@ def sample_sparse_scm(
     lag_correlation: np.ndarray,
     expected_indegree: float,
     max_indegree: int,
+    structural_coefficient_scale: float,
+    ar_coefficient_scale: float,
+    max_absolute_ar_coefficient: float,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """采样稀疏有向无环 SEM，并偏向真实数据中高相关的特征对。
 
     adjacency[parent, child]=True。先抽拓扑序再只从前驱中抽父节点，因此
     无需事后删环；每条边、AR 系数和节点非线性都会随 episode 保存。
+
+    ``structural_coefficient_scale`` 与 ``ar_coefficient_scale`` 分别控制同刻
+    结构传播和时间持续性。二者必须分开控制：只降低 DAG 边仍可能因接近 1
+    的 AR 系数跨期积累出全局强相关，只降低 AR 又会损失横截面代理结构。
     """
 
     num_features = reference_correlation.shape[0]
@@ -344,14 +430,27 @@ def sample_sparse_scm(
         for parent in parents:
             empirical_sign = np.sign(reference_correlation[child, parent])
             sign = empirical_sign if empirical_sign != 0 else rng.choice([-1.0, 1.0])
-            coefficient = sign * rng.uniform(0.15, 0.65) / math.sqrt(indegree)
+            # 先按入度归一化，再统一缩放。这样高入度节点不会仅因父节点多就
+            # 获得更大的结构方差，而 scale 可以直接控制全局传播强度。
+            coefficient = (
+                sign
+                * rng.uniform(0.15, 0.65)
+                * structural_coefficient_scale
+                / math.sqrt(indegree)
+            )
             adjacency[parent, child] = True
             coefficients[parent, child] = coefficient
-    # 用真实 lag-1 相关作为 AR 中心，并加 episode 级扰动以扩大机制覆盖。
+    # 用真实 lag-1 相关作为 AR 中心并保留 episode 级扰动，然后整体缩放。
+    # 缩放保留每列持续性的相对顺序和正负号，不像硬设统一 rho 那样丢失
+    # 校准信息；最终再限制绝对值以确保稳定动态。
+    calibrated_ar = (
+        np.nan_to_num(lag_correlation, nan=0.70)
+        + rng.normal(0.0, 0.04, num_features)
+    ) * ar_coefficient_scale
     ar_coefficients = np.clip(
-        np.nan_to_num(lag_correlation, nan=0.70) + rng.normal(0.0, 0.04, num_features),
-        -0.20,
-        0.98,
+        calibrated_ar,
+        -max_absolute_ar_coefficient,
+        max_absolute_ar_coefficient,
     ).astype(np.float32)
     return adjacency, coefficients, ar_coefficients, topological_order, node_nonlinearity
 
@@ -420,6 +519,57 @@ def cross_sectional_rank_dense(latent: np.ndarray, asset_mask: np.ndarray) -> np
     return output
 
 
+def summarize_generated_dependence(
+    x: np.ndarray,
+    asset_mask: np.ndarray,
+    max_rows: int,
+    rng: np.random.Generator,
+) -> Optional[Dict[str, Any]]:
+    """审计最终训练视图中的跨特征相关性与条件数。
+
+    校准矩阵只影响 DAG 边的抽样概率，不能保证多层结构方程生成后的相关性
+    仍与校准矩阵同量级。因此审计必须作用于最终的 ``complete_rank_x``，而
+    不是只检查输入校准量。最多抽取 ``max_rows`` 个有效股票月，避免在 4096
+    episode 数据上为诊断执行不必要的大矩阵乘法。
+
+    此函数只读取 X，并使用独立 RNG；它不会改变结构、目标或父节点随机流。
+    """
+
+    if max_rows == 0:
+        return None
+    valid_rows = np.asarray(x[asset_mask], dtype=np.float64)
+    if valid_rows.shape[0] > max_rows:
+        selected = rng.choice(valid_rows.shape[0], size=max_rows, replace=False)
+        valid_rows = valid_rows[selected]
+    if valid_rows.shape[0] < 2:
+        raise RuntimeError("not enough valid rows for feature-correlation audit")
+
+    correlation = np.corrcoef(valid_rows, rowvar=False)
+    # 完整 rank X 正常情况下每列都有方差；这里仍显式拒绝退化列，防止 NaN
+    # 被后续 quantile 静默吞掉并生成表面正常的 manifest。
+    if not np.isfinite(correlation).all():
+        raise RuntimeError("non-finite generated feature correlation detected")
+    upper = np.abs(
+        correlation[np.triu_indices(correlation.shape[0], k=1)]
+    )
+    quantile_levels = (0.50, 0.75, 0.90, 0.95, 0.99)
+    quantiles = np.quantile(upper, quantile_levels)
+    # 在相关矩阵上加入与 Parent Interaction 默认一致量级的 ridge，再记录
+    # 条件数。它不是训练输入，只用于比较不同生成版本的条件识别难度。
+    ridge_correlation = correlation + 0.01 * np.eye(correlation.shape[0])
+    return {
+        "sampled_valid_rows": int(valid_rows.shape[0]),
+        "absolute_correlation_quantiles": {
+            f"q{int(level * 100):02d}": float(value)
+            for level, value in zip(quantile_levels, quantiles)
+        },
+        "absolute_correlation_maximum": float(upper.max(initial=0.0)),
+        "ridge_correlation_condition_number": float(
+            np.linalg.cond(ridge_correlation)
+        ),
+    }
+
+
 def generate_feature_mask(
     asset_mask: np.ndarray,
     observation_rate: np.ndarray,
@@ -454,14 +604,26 @@ def generate_feature_mask(
 def make_episode(
     args: argparse.Namespace,
     calibration: Mapping[str, np.ndarray],
-    rng: np.random.Generator,
+    episode_seed: int,
     parent_selection_counts: np.ndarray,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    min_parents: Optional[int] = None,
+    max_parents: Optional[int] = None,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any], np.ndarray]:
     """生成一个完整全合成 episode 及其可序列化元数据。
 
     顺序为 A → 特征 DAG → 完整潜在 X → 截面秩 → M → 已知目标方程。
     输出还保存 SCM 图和参数，使 X 的因果结构能够被复核或用于辅助监督。
     """
+
+    # 结构和目标使用由 episode seed 派生的独立随机流。缺失审计掩码消耗的
+    # 随机数不会影响目标随机流，因而修改审计协议不会间接改变父节点集合。
+    rng = np.random.default_rng(np.random.SeedSequence([episode_seed, 0]))
+    target_rng = np.random.default_rng(
+        np.random.SeedSequence([episode_seed, 2])
+    )
+    correlation_audit_rng = np.random.default_rng(
+        np.random.SeedSequence([episode_seed, 3])
+    )
 
     feature_observation_rate = calibration["feature_observation_rate"]
     lag_correlation = calibration["lag1_correlation"]
@@ -477,28 +639,64 @@ def make_episode(
     # 每个 episode 独立抽取一个已知的稀疏动态特征 SCM。
     adjacency, scm_coefficients, ar_coefficients, order, node_nonlinearity = sample_sparse_scm(
         reference_correlation, lag_correlation,
-        args.expected_indegree, args.max_indegree, rng,
+        args.expected_indegree, args.max_indegree,
+        args.structural_coefficient_scale,
+        args.ar_coefficient_scale,
+        args.max_absolute_ar_coefficient,
+        rng,
     )
     latent = generate_latent_x(
         args.num_assets, args.time_steps, args.burn_in,
         adjacency, scm_coefficients, ar_coefficients, order, node_nonlinearity, rng,
     )
-    # 先生成完整潜在值，再按真实数据流程做月度截面秩和缺失机制。
+    # complete_rank_x 是 Full 数据的正式训练视图。它在每个有效股票月对全部
+    # D 个合成特征都有值，因此不会像“遮蔽后补全”那样破坏已知 SCM 关系。
     complete_rank_x = cross_sectional_rank_dense(latent, asset_mask)
-    feature_mask = generate_feature_mask(
+    feature_mask = np.broadcast_to(
+        asset_mask[:, :, None], complete_rank_x.shape
+    ).copy()
+    X = np.where(feature_mask, complete_rank_x, 0.0).astype(np.float32, copy=False)
+    # 对最终训练视图而非潜变量做审计。独立随机流保证开关审计或改变抽样行数
+    # 不会改变目标机制，因此不同设置仍可进行严格的标签对照。
+    feature_dependence_audit = summarize_generated_dependence(
+        X,
+        asset_mask,
+        args.correlation_audit_rows,
+        correlation_audit_rng,
+    )
+
+    # 仍按真实 GKX 观测率生成原始缺失视图，但它只用于检查缺失率和后续
+    # missingness ablation。该掩码既不遮蔽 X，也不参与候选/标签生成。
+    observed_feature_mask = generate_feature_mask(
         asset_mask, feature_observation_rate, args.missing_persistence, rng
     )
-    X = np.where(feature_mask, complete_rank_x, 0.0).astype(np.float32)
+
+    # 默认使用训练分布的 K 区间；main 可为 test 显式传入固定 K。测试集覆盖
+    # 训练区间上界时属于预先声明的条件评估，不会反向改变训练标签分布。
+    episode_min_parents = args.min_parents if min_parents is None else min_parents
+    episode_max_parents = args.max_parents if max_parents is None else max_parents
+
     # 与半合成数据共用目标生成器，确保 z/tau 的含义完全一致。
     target_arrays, target_metadata = synthesize_target(
-        X, asset_mask, feature_mask, rng,
-        args.min_parents, args.max_parents,
+        X, asset_mask, feature_mask, target_rng,
+        episode_min_parents, episode_max_parents,
         args.min_parent_observations,
         args.min_parent_observation_rate,
         parent_selection_counts,
         args.snr_low, args.snr_high,
         args.hard_negative_threshold,
+        parent_sampling_method=args.parent_sampling_method,
     )
+    # Full 的候选定义必须与真实缺失过程完全解耦。只要股票月有效，每个特征
+    # 的观测数和观测率都相同，因此这里应严格得到 D 个候选；失败就立即停止
+    # 生成，避免悄悄产出带列身份/缺失率标签捷径的数据。
+    if not bool(target_arrays["parent_candidate_mask"].all()):
+        candidate_count = int(target_arrays["parent_candidate_mask"].sum())
+        raise RuntimeError(
+            "complete Full panel must make every feature a parent candidate: "
+            f"found {candidate_count}/{X.shape[-1]}; check asset coverage and "
+            "--min-parent-observations"
+        )
     arrays: Dict[str, np.ndarray] = {
         "X": X,
         "Y": target_arrays["Y"],
@@ -510,15 +708,37 @@ def make_episode(
         "target_mask": asset_mask.copy(),
         "time_padding_mask": ~asset_mask.any(axis=0),
     }
+    valid_value_count = max(
+        int(asset_mask.sum()) * observed_feature_mask.shape[-1], 1
+    )
+    original_observation_counts = observed_feature_mask.sum(
+        axis=(0, 1)
+    ).astype(np.int64)
     edge_indices = np.argwhere(adjacency)
     metadata = {
         "asset_observation_rate": float(asset_mask.mean()),
         "feature_observation_rate_given_asset": float(
-            feature_mask.sum() / max(asset_mask.sum() * feature_mask.shape[-1], 1)
+            observed_feature_mask.sum() / valid_value_count
         ),
+        "usable_feature_rate_given_asset": float(feature_mask.sum() / valid_value_count),
+        "training_feature_source": "complete_rank_x",
+        "imputation_method": "none_complete_synthetic_panel",
+        "imputed_value_count": 0,
+        "imputed_fraction_of_usable_values": 0.0,
+        "original_feature_observation_counts": original_observation_counts.tolist(),
+        "original_feature_observation_rates": (
+            original_observation_counts / max(int(asset_mask.sum()), 1)
+        ).tolist(),
+        "structure_rng_stream": "SeedSequence([episode_seed, 0])",
+        "missingness_audit_rng_stream": "structure RNG stream after X generation",
+        "target_rng_stream": "SeedSequence([episode_seed, 2])",
         "feature_edge_count": int(adjacency.sum()),
         "feature_expected_indegree": args.expected_indegree,
+        "structural_coefficient_scale": args.structural_coefficient_scale,
+        "ar_coefficient_scale": args.ar_coefficient_scale,
+        "max_absolute_ar_coefficient": args.max_absolute_ar_coefficient,
         "burn_in": args.burn_in,
+        "feature_dependence_audit": feature_dependence_audit,
         # 图、目标机制和干预端点只用于生成复现/审计，不进入训练 NPZ。
         "feature_scm_edges": [
             [int(parent), int(child), float(scm_coefficients[parent, child])]
@@ -537,7 +757,12 @@ def make_episode(
         ).tolist(),
         **target_metadata,
     }
-    return arrays, metadata
+    # 精确原始掩码只用于复现/消融，沿 D 维压缩为 ceil(D/8) 个字节，避免
+    # 将额外布尔张量放进每个训练 batch。bitorder 固定后可用 np.unpackbits 恢复。
+    observed_feature_mask_packed = np.packbits(
+        observed_feature_mask, axis=-1, bitorder="little"
+    )
+    return arrays, metadata, observed_feature_mask_packed
 
 
 def main() -> None:
@@ -580,32 +805,55 @@ def main() -> None:
         "test": args.test_episodes,
     }
     # 三个 split 使用独立且可由根 seed 完全复现的随机流。
-    root_seed = np.random.SeedSequence(args.seed)
+    root_seed = np.random.SeedSequence([args.seed, 200])
     split_seed_sequences = root_seed.spawn(len(requested))
     metadata_path = args.output_dir / "generation_metadata.jsonl.gz"
     metadata_temporary = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
     shard_files: List[str] = []
+    observed_mask_shard_files: List[str] = []
     total_episodes = 0
     parent_selection_counts_by_split: Dict[str, List[int]] = {}
+    parent_count_histogram_by_split: Dict[str, Dict[str, int]] = {}
+    dependence_audit_summary_by_split: Dict[str, Dict[str, Any]] = {}
 
     with gzip.open(metadata_temporary, "wt", encoding="utf-8", newline="\n") as metadata_file:
         for (split, episode_count), split_seed in zip(requested.items(), split_seed_sequences):
             split_directory = args.output_dir / split
             split_directory.mkdir(parents=True, exist_ok=True)
             split_rng = np.random.default_rng(split_seed)
-            # train/validation/test 分别均衡，防止某个 split 的规模影响另一个 split。
+            # train/validation 学习 K=10--20 的可变稀疏度；可选的 test 固定 K
+            # 只改变评估条件。两个边界随后写入 manifest，避免分布差异被隐藏。
+            if split == "test" and args.test_parent_count > 0:
+                split_min_parents = args.test_parent_count
+                split_max_parents = args.test_parent_count
+            else:
+                split_min_parents = args.min_parents
+                split_max_parents = args.max_parents
+            # 计数始终保存用于审计；uniform 模式不会用历史次数影响父节点抽样。
             parent_selection_counts = np.zeros(len(features), dtype=np.int64)
+            parent_count_histogram = np.zeros(split_max_parents + 1, dtype=np.int64)
+            split_dependence_audits: List[Mapping[str, Any]] = []
             pending: List[Dict[str, np.ndarray]] = []
+            pending_observed_masks: List[np.ndarray] = []
             shard_index = 0
             for local_index in range(episode_count):
                 # seed 只写入分片外的生成元数据，支持逐 episode 重建。
                 episode_seed = int(split_rng.integers(0, np.iinfo(np.uint32).max))
-                rng = np.random.default_rng(episode_seed)
-                episode_arrays, episode_metadata = make_episode(
-                    args, calibration, rng, parent_selection_counts
+                episode_arrays, episode_metadata, observed_mask_packed = make_episode(
+                    args,
+                    calibration,
+                    episode_seed,
+                    parent_selection_counts,
+                    min_parents=split_min_parents,
+                    max_parents=split_max_parents,
                 )
                 position_in_shard = len(pending)
                 pending.append(episode_arrays)
+                pending_observed_masks.append(observed_mask_packed)
+                parent_count_histogram[int(episode_arrays["z"].sum())] += 1
+                dependence_audit = episode_metadata["feature_dependence_audit"]
+                if dependence_audit is not None:
+                    split_dependence_audits.append(dependence_audit)
                 metadata = {
                     "episode_id": total_episodes,
                     "source_type": "full_synthetic",
@@ -624,9 +872,57 @@ def main() -> None:
                     relative_path = Path(split) / f"shard_{shard_index:05d}.npz"
                     stack_and_save(args.output_dir / relative_path, pending)
                     shard_files.append(str(relative_path))
+                    observed_relative_path = (
+                        Path("audit_observed_feature_mask")
+                        / split
+                        / f"shard_{shard_index:05d}.npz"
+                    )
+                    atomic_npz(
+                        args.output_dir / observed_relative_path,
+                        observed_feature_mask_packed=np.stack(
+                            pending_observed_masks
+                        ).astype(np.uint8, copy=False),
+                    )
+                    observed_mask_shard_files.append(str(observed_relative_path))
                     pending = []
+                    pending_observed_masks = []
                     shard_index += 1
             parent_selection_counts_by_split[split] = parent_selection_counts.tolist()
+            parent_count_histogram_by_split[split] = {
+                str(parent_count): int(parent_count_histogram[parent_count])
+                for parent_count in range(
+                    split_min_parents, split_max_parents + 1
+                )
+            }
+            if split_dependence_audits:
+                quantile_names = ("q50", "q75", "q90", "q95", "q99")
+                condition_numbers = np.asarray(
+                    [
+                        audit["ridge_correlation_condition_number"]
+                        for audit in split_dependence_audits
+                    ],
+                    dtype=np.float64,
+                )
+                dependence_audit_summary_by_split[split] = {
+                    "audited_episodes": len(split_dependence_audits),
+                    "rows_per_episode_at_most": args.correlation_audit_rows,
+                    "mean_absolute_correlation_quantiles": {
+                        name: float(
+                            np.mean(
+                                [
+                                    audit["absolute_correlation_quantiles"][name]
+                                    for audit in split_dependence_audits
+                                ]
+                            )
+                        )
+                        for name in quantile_names
+                    },
+                    "ridge_correlation_condition_number": {
+                        "median": float(np.median(condition_numbers)),
+                        "p90": float(np.quantile(condition_numbers, 0.90)),
+                        "maximum": float(condition_numbers.max()),
+                    },
+                }
 
     os.replace(metadata_temporary, metadata_path)
 
@@ -646,24 +942,80 @@ def main() -> None:
         "C_handling": "Pass C=None and construct the model with market_state_dim=0.",
         "distribution_matching": {
             "marginal": "monthly cross-sectional ranks mapped to [-1,1]",
-            "cross_feature": "sparse SCM edge sampling weighted by real feature correlations",
-            "temporal": "feature AR coefficients calibrated from real lag-1 correlations",
-            "missingness": "feature rates calibrated from real masks with persistent missing states",
+            "cross_feature": (
+                "sparse SCM edge sampling weighted by real feature correlations; "
+                "edge coefficients are globally scaled to prevent pervasive "
+                "multi-hop collinearity"
+            ),
+            "temporal": (
+                "feature AR coefficients calibrated from real lag-1 correlations, "
+                "then scaled and stability-clipped before simulation"
+            ),
+            "missingness": (
+                "raw feature rates are calibrated from real masks with persistent "
+                "missing states, but this mask is audit-only and never modifies the "
+                "formal complete_rank_x training input or parent eligibility"
+            ),
             "asset_coverage": "contiguous listing spells calibrated to real aligned episodes",
+        },
+        "feature_dependence_control": {
+            "structural_coefficient_scale": args.structural_coefficient_scale,
+            "ar_coefficient_scale": args.ar_coefficient_scale,
+            "max_absolute_ar_coefficient": args.max_absolute_ar_coefficient,
+            "audit_semantics": (
+                "absolute Pearson correlations are computed on sampled valid rows "
+                "from final complete_rank_x; the ridge condition number uses "
+                "corr(X)+0.01*I"
+            ),
+            "summary_by_split": dependence_audit_summary_by_split,
         },
         "mask_semantics": {
             "asset_mask": "1 iff the synthetic stock is listed in that period",
-            "feature_mask": "1 iff listed and the synthetic characteristic is observed",
-            "parent_candidate_mask": "1 iff the feature meets both parent observation thresholds; z/tau losses must be restricted to this set",
+            "feature_mask": (
+                "broadcast(asset_mask): every one of the D synthetic features is "
+                "available at every listed stock-month"
+            ),
+            "parent_candidate_mask": (
+                "all True [D] by construction: every synthetic feature has equal "
+                "eligibility; z/tau losses are defined over all D features"
+            ),
             "target_mask": "1 iff synthetic Y is valid; identical to asset_mask in these episodes",
             "time_padding_mask": "PyTorch convention: 1 iff every asset is absent and the time step must be ignored",
+        },
+        "training_feature_view": {
+            "source": "complete_rank_x",
+            "imputation": "none",
+            "all_features_available_when_asset_is_listed": True,
+            "raw_missingness_used_for_training": False,
         },
         "tau_semantics": "controlled direct q20-to-q80 effect, averaged over asset_mask=1",
         "parent_sampling": {
             "minimum_observations": args.min_parent_observations,
             "minimum_observation_rate": args.min_parent_observation_rate,
-            "method": "least-selected eligible features first, with random tie-breaking, balanced independently within each split",
+            "minimum_parent_count": args.min_parents,
+            "maximum_parent_count": args.max_parents,
+            "test_parent_count": (
+                args.test_parent_count if args.test_parent_count > 0 else None
+            ),
+            "count_distribution_by_split": {
+                "train": "discrete uniform on [minimum_parent_count, maximum_parent_count]",
+                "validation": "discrete uniform on [minimum_parent_count, maximum_parent_count]",
+                "test": (
+                    f"fixed at {args.test_parent_count}"
+                    if args.test_parent_count > 0
+                    else "discrete uniform on [minimum_parent_count, maximum_parent_count]"
+                ),
+            },
+            "method": args.parent_sampling_method,
+            "method_description": (
+                "uniform sampling without replacement from all D features in every "
+                "episode; raw missingness never changes eligibility"
+                if args.parent_sampling_method == "uniform"
+                else "least-selected eligible features first, with random "
+                "tie-breaking, balanced independently within each split"
+            ),
             "selection_counts_by_split": parent_selection_counts_by_split,
+            "actual_count_histogram_by_split": parent_count_histogram_by_split,
         },
         "episode_counts": requested,
         "episodes_per_shard": args.episodes_per_shard,
@@ -678,6 +1030,20 @@ def main() -> None:
             "parent_candidate_mask": "bool [E,D]",
             "target_mask": "bool [E,N,T]",
             "time_padding_mask": "bool [E,T]",
+        },
+        "audit_arrays": {
+            "observed_feature_mask": {
+                "semantics": (
+                    "audit-only synthetic observation mask calibrated from raw GKX; "
+                    "it never masks complete_rank_x or changes parent eligibility"
+                ),
+                "encoding": "np.packbits(axis=-1, bitorder='little')",
+                "stored_key": "observed_feature_mask_packed",
+                "packed_shape": "uint8 [E,N,T,ceil(D/8)]",
+                "restore": "np.unpackbits(packed, axis=-1, count=D, bitorder='little').astype(bool)",
+                "shards": observed_mask_shard_files,
+                "loaded_by_training_dataset": False,
+            }
         },
         "generation_metadata": "generation_metadata.jsonl.gz",
         "readme": "README.md",

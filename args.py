@@ -22,7 +22,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-ratio", type=float, default=0.30)
     parser.add_argument("--samples-per-epoch", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/causalrank"))
-    parser.add_argument("--resume", type=Path, default=None)
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="完整恢复 checkpoint（模型、优化器、调度器、AMP 与随机状态）",
+    )
+    checkpoint_group.add_argument(
+        "--init-model",
+        type=Path,
+        default=None,
+        help=(
+            "仅加载 checkpoint 中的模型权重；优化器、学习率调度器和训练轮次"
+            "均重新初始化，供 full -> semi 两阶段训练使用"
+        ),
+    )
+    parser.add_argument(
+        "--save-best",
+        action="store_true",
+        help=(
+            "按 validation loss 覆盖保存 best_checkpoint.pt；默认关闭，"
+            "因此普通单阶段训练仍只维护原有 checkpoint.pt"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=10)
     # 完整面板在双 24 GiB GPU 上实测可稳定完成整轮的保守 micro-batch。
     parser.add_argument("--batch-size", type=int, default=2)
@@ -33,8 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--positive-class-weight",
         type=float,
-        default=25.25,
-        help="固定 BCE 正类权重；当前128-episode训练集的全局负正比约为25.25",
+        default=2.77,
+        help=(
+            "固定 BCE 正类权重；固定20个父节点的 full/semi 128-episode "
+            "训练集平均全局负正比约为2.77"
+        ),
     )
     parser.add_argument(
         "--warmup-epochs",
