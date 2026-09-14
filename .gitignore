@@ -3,15 +3,24 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
 
 # Large source datasets and generated episode shards are reproducible artifacts.
-/data/
+# Keep the Python package initializer, but never commit datasets beneath data/.
+/data/*
+!/data/__init__.py
 /data_generation/*/
 
 # Training products and crash dumps
 /runs/
 *.pt
 *.pth
+*.ckpt
+*.log
 core
 core.*
 
